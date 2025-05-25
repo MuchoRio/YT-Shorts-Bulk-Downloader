@@ -1,3 +1,5 @@
+# main.py
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
@@ -6,6 +8,8 @@ import time
 import random
 from datetime import datetime
 import json
+import subprocess # To run yt-dlp
+from urllib.parse import urljoin, urlparse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -21,18 +25,18 @@ import openpyxl
 
 class YouTubeShortsScraper:
     """
-    Kelas ini bertanggung jawab untuk logika scraping YouTube Shorts.
+    This class handles the logic for scraping and downloading YouTube Shorts.
     """
     def __init__(self, output_folder, log_callback, progress_callback, status_callback, config):
         """
-        Inisialisasi scraper.
+        Initializes the scraper.
 
         Args:
-            output_folder (str): Lokasi folder untuk menyimpan output.
-            log_callback (function): Fungsi callback untuk logging ke GUI.
-            progress_callback (function): Fungsi callback untuk memperbarui progress bar di GUI.
-            status_callback (function): Fungsi callback untuk memperbarui status di GUI.
-            config (dict): Konfigurasi scraping dari GUI.
+            output_folder (str): Output folder location.
+            log_callback (function): Callback function for logging to GUI.
+            progress_callback (function): Callback function for updating GUI progress bar.
+            status_callback (function): Callback function for updating GUI status.
+            config (dict): Scraping and download configuration from GUI.
         """
         self.output_folder = output_folder
         self.log_callback = log_callback
@@ -40,36 +44,37 @@ class YouTubeShortsScraper:
         self.status_callback = status_callback
         self.config = config
         self.driver = None
-        self.scraped_data = []
-        self.stop_scraping_flag = threading.Event() # Event untuk menghentikan scraping
+        self.scraped_data = [] # List to store {'URL': ..., 'Title': ..., 'Description': ..., 'Download_Status': ...}
+        self.stop_scraping_flag = threading.Event() # Event to stop scraping
         self.start_time = None
         self.scroll_count = 0
-        self.no_new_urls_consecutive_scrolls = 0 # Counter untuk mendeteksi potensi blocking
+        self.no_new_urls_consecutive_scrolls = 0 # Counter for potential blocking detection
+        self.download_errors = [] # List to store video URLs that failed to download
 
     def _log(self, message):
         """
-        Mencatat pesan ke log GUI dan file log.
-        Setiap entri log mencakup timestamp.
+        Logs messages to the GUI log area and a log file.
+        Each log entry includes a timestamp.
 
         Args:
-            message (str): Pesan yang akan dicatat.
+            message (str): Message to log.
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] {message}"
         self.log_callback(log_message)
-        # Pastikan folder output ada sebelum mencoba menulis file log
+        # Ensure the output folder exists before writing the log file
         os.makedirs(self.output_folder, exist_ok=True)
         with open(os.path.join(self.output_folder, "scraping_log.txt"), "a", encoding="utf-8") as f:
             f.write(log_message + "\n")
 
     def _initialize_webdriver(self):
         """
-        Menginisialisasi Selenium WebDriver dengan opsi yang dikonfigurasi.
+        Initializes the Selenium WebDriver with configured options.
         """
-        self._log("Menginisialisasi WebDriver...")
+        self._log("Initializing WebDriver...")
         options = Options()
 
-        # Konfigurasi opsi browser dari GUI
+        # Configure browser options from GUI
         if self.config["headless_mode"]:
             options.add_argument("--headless=new")
         if self.config["disable_sandbox"]:
@@ -102,309 +107,572 @@ class YouTubeShortsScraper:
         ]
         options.add_argument(f"user-agent={random.choice(user_agents)}")
 
-        # Konfigurasi Proxy
+        # Proxy Configuration
         if self.config["proxy_input"]:
             options.add_argument(f"--proxy-server={self.config['proxy_input']}")
-            self._log(f"Menggunakan proxy: {self.config['proxy_input']}")
+            self._log(f"Using proxy: {self.config['proxy_input']}")
 
         try:
-            # Menggunakan ChromeDriverManager untuk mengelola ChromeDriver
+            # Use ChromeDriverManager to manage ChromeDriver
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
-            self.driver.set_page_load_timeout(30) # Set timeout untuk loading halaman
-            self._log("WebDriver berhasil diinisialisasi.")
+            self.driver.set_page_load_timeout(30) # Set timeout for page loading
+            self._log("WebDriver initialized successfully.")
         except WebDriverException as e:
-            self._log(f"Error saat menginisialisasi WebDriver: {e}")
-            self.status_callback("Error: Gagal menginisialisasi browser. Pastikan Chrome terinstall dan up-to-date.")
-            self.driver = None # Pastikan driver None jika gagal inisialisasi
+            self._log(f"Error initializing WebDriver: {e}")
+            self.status_callback("Error: Failed to initialize browser. Make sure Chrome is installed and up-to-date.")
+            self.driver = None # Ensure driver is None if initialization fails
             raise
 
-    def _scrape_shorts_data(self):
+    def _get_video_description(self, video_url):
         """
-        Melakukan scraping data URL dan judul Shorts dari halaman YouTube.
+        Visits individual video URL to get the description.
+        """
+        try:
+            self._log(f"Visiting {video_url} to get description...")
+            self.driver.get(video_url)
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "ytd-watch-flexy, ytm-single-column-watch-next-results")) # Wait for video page to load
+            )
+
+            # Try to click "more" or "show more" button if available
+            try:
+                # Common selector for "show more" button
+                more_button = self.driver.find_element(By.CSS_SELECTOR, "tp-yt-paper-button[aria-label*='show more'], ytd-text-inline-expander button")
+                if more_button.is_displayed() and more_button.is_enabled():
+                    self.driver.execute_script("arguments[0].click();", more_button) # Use JS click for robustness
+                    time.sleep(1) # Give time for description to expand
+            except NoSuchElementException:
+                pass # No 'more' button found
+
+            # Find description element (selectors may vary between Shorts and regular videos)
+            description_element = None
+            try:
+                # Selector for description in ytd-watch-flexy (regular videos)
+                description_element = self.driver.find_element(By.CSS_SELECTOR, "ytd-expander #description-inline-expander, #description-inline-expander div.ytd-text-inline-expander")
+            except NoSuchElementException:
+                try:
+                    # Selector for description in Shorts (might be simple text or in a particular div)
+                    # This might require more specific selectors for Shorts if present
+                    description_element = self.driver.find_element(By.CSS_SELECTOR, "ytd-reel-player-overlay-renderer #description-text, ytm-autonav-renderer #description-text")
+                except NoSuchElementException:
+                    pass
+
+            if description_element:
+                description = description_element.text.strip()
+                self._log(f"Description found: {description[:50]}...") # Log first 50 characters
+                return description
+            else:
+                self._log("Description not found for this video.")
+                return ""
+        except Exception as e:
+            self._log(f"Error getting description from {video_url}: {e}")
+            return ""
+
+    def _scrape_shorts_data_phase(self):
+        """
+        Performs the scraping phase: collecting URLs, Titles, and Descriptions.
         """
         self.scraped_data = []
-        urls_found = set() # Menggunakan set untuk menghindari duplikasi URL
-        previous_urls_count = 0 # Untuk deteksi URL baru setelah scroll
-
-        self.start_time = time.time()
+        urls_found_set = set()
+        previous_urls_count = 0
         self.scroll_count = 0
-        self.no_new_urls_consecutive_scrolls = 0 # Reset counter
-        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+        self.no_new_urls_consecutive_scrolls = 0
+        
+        # Store initial URL to return to
+        initial_channel_url = self.driver.current_url
 
-        # Inisialisasi progress bar sebagai indeterminate jika tidak ada target URL
-        if self.config["target_url_count"] == 0:
-            self.progress_callback(0, 0) # Mode indeterminate
+        try:
+            self._log(f"Starting scraping phase for: {self.config['channel_url']}")
+            self.driver.get(self.config["channel_url"])
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            self.status_callback("Scraping: Opening channel URL...")
 
-        while True:
-            if self.stop_scraping_flag.is_set():
-                self._log("Proses scraping dibatalkan oleh pengguna.")
-                self.status_callback("Scraping Dibatalkan.")
-                break
+            last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
 
-            self.scroll_count += 1
-            self.status_callback(f"Melakukan scroll ke-{self.scroll_count}...")
-            self._log(f"Melakukan scroll ke-{self.scroll_count}...")
+            if self.config["target_video_count"] == 0:
+                self.progress_callback(0, 0) # Indeterminate mode
 
-            # Implementasi metode scrolling
-            if self.config["scrolling_method"] == "Send END Key":
-                self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.END)
-            elif self.config["scrolling_method"] == "Scroll to Bottom (JS)":
-                self.driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-            elif self.config["scrolling_method"] == "Scroll by Viewport (JS)":
-                # Scroll 90% dari tinggi viewport
-                self.driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
+            while True:
+                if self.stop_scraping_flag.is_set():
+                    self._log("Scraping process cancelled by user.")
+                    self.status_callback("Scraping Cancelled.")
+                    return False # Indicate scraping was not successful
 
-            # Random delay
-            # Menggunakan random.randint karena scroll delay sekarang bilangan bulat
-            delay = random.randint(1, self.config["scroll_delay"]) # Min 1 detik, Max = Scroll Delay
-            self._log(f"Menunggu {delay} detik (random delay).")
-            time.sleep(delay)
+                self.scroll_count += 1
+                self.status_callback(f"Scraping: Scrolling {self.scroll_count}...")
+                self._log(f"Scrolling {self.scroll_count}...")
 
-            try:
-                # Mencari elemen video Shorts berdasarkan struktur HTML yang diberikan.
-                # Kami mencari tag 'a' yang memiliki class yang sesuai dan '/shorts/' dalam href-nya.
+                # Scrolling method implementation
+                if self.config["scrolling_method"] == "Send END Key":
+                    self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.END)
+                elif self.config["scrolling_method"] == "Scroll to Bottom (JS)":
+                    self.driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+                elif self.config["scrolling_method"] == "Scroll by Viewport (JS)":
+                    self.driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
+
+                time.sleep(self.config["scroll_delay"]) # Fixed delay
+
                 video_elements = self.driver.find_elements(By.CSS_SELECTOR,
                     "a.shortsLockupViewModelHostEndpoint.reel-item-endpoint[href*='/shorts/'], " +
                     "a.shortsLockupViewModelHostEndpoint.shortsLockupViewModelHostOutsideMetadataEndpoint[href*='/shorts/']"
                 )
 
-                # Dapatkan URL yang sudah ada sebelum penambahan di iterasi ini
-                num_urls_before_current_scan = len(urls_found)
+                num_urls_before_current_scan = len(urls_found_set)
 
                 for element in video_elements:
                     href = element.get_attribute("href")
                     title = ""
 
-                    # Mencoba mendapatkan judul. Ada dua kemungkinan lokasi judul:
-                    # 1. Dari atribut 'title' pada tag <a> itu sendiri.
-                    # 2. Dari teks di dalam tag <span> yang merupakan anak dari tag <a>,
-                    #    terutama untuk a.shortsLockupViewModelHostOutsideMetadataEndpoint.
                     if element.get_attribute("title"):
                         title = element.get_attribute("title").strip()
                     else:
-                        # Mencoba menemukan span di dalam elemen a untuk mendapatkan judul teks
                         try:
                             title_span = element.find_element(By.CSS_SELECTOR, "span.yt-core-attributed-string")
                             title = title_span.text.strip()
                         except NoSuchElementException:
-                            pass # Tidak ada span judul yang ditemukan, biarkan title kosong
+                            pass
 
                     if href and "/shorts/" in href:
-                        # Pastikan URL lengkap dan tidak relatif
+                        # Ensure URL is absolute
                         if not href.startswith("http"):
-                            # Perbaiki URL relatif ke URL absolut YouTube
-                            if href.startswith("/"):
-                                href = f"https://www.youtube.com{href}"
-                            else:
-                                # Fallback jika format URL relatif tidak terduga, coba gabungkan dengan base URL
-                                # Namun, disarankan URL yang dimasukkan pengguna sudah channel URL lengkap
-                                try:
-                                    from urllib.parse import urljoin
-                                    base_url = self.config['channel_url'].split('/shorts')[0] # Ambil bagian dasar URL channel
-                                    href = urljoin(base_url, href)
-                                    self._log(f"URL relatif dikonversi ke absolut: {href}")
-                                except Exception as url_err:
-                                    self._log(f"Peringatan: Gagal mengonversi URL relatif '{href}' ke absolut. Error: {url_err}")
-                                    # Lanjutkan saja dengan URL relatif, mungkin YouTube bisa menanganinya
-                                    pass
+                            href = urljoin(self.config['channel_url'], href)
 
+                        if href not in urls_found_set:
+                            self.scraped_data.append({"URL Video": href, "Title": title, "Description": "", "Download_Status": "N"})
+                            urls_found_set.add(href)
+                            self._log(f"Found Shorts (URL): {title} ({href})")
 
-                        if href not in urls_found:
-                            self.scraped_data.append({"URL Video": href, "Title": title})
-                            urls_found.add(href)
-                            self._log(f"Ditemukan: {title} ({href})")
-
-                # Cek apakah ada URL baru yang ditemukan di scroll ini
-                if len(urls_found) > num_urls_before_current_scan:
-                    self.no_new_urls_consecutive_scrolls = 0 # Reset counter jika ada URL baru
+                if len(urls_found_set) > num_urls_before_current_scan:
+                    self.no_new_urls_consecutive_scrolls = 0
                 else:
-                    self.no_new_urls_consecutive_scrolls += 1 # Increment jika tidak ada URL baru
+                    self.no_new_urls_consecutive_scrolls += 1
 
-                self._log(f"Total URL unik ditemukan: {len(urls_found)}")
-                self.progress_callback(len(urls_found), self.config["target_url_count"])
+                self._log(f"Total unique URLs found during scraping: {len(urls_found_set)}")
+                self.progress_callback(len(urls_found_set), self.config["target_video_count"])
 
-                if self.config["target_url_count"] > 0 and len(urls_found) >= self.config["target_url_count"]:
-                    self._log(f"Jumlah URL target ({self.config['target_url_count']}) tercapai.")
-                    self.status_callback("Jumlah URL target tercapai.")
+                if self.config["target_video_count"] > 0 and len(urls_found_set) >= self.config["target_video_count"]:
+                    self._log(f"Target video count ({self.config['target_video_count']}) reached. Stopping scraping.")
+                    self.status_callback("Target video count reached. Stopping scraping.")
                     break
 
                 new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
                 if new_height == last_height:
-                    self._log("Tidak ada konten baru yang bisa di-scroll (mencapai akhir halaman atau tidak ada konten baru dimuat). Mengakhiri scraping.")
-                    self.status_callback("Tidak ada konten baru yang bisa di-scroll.")
+                    self._log("No new content to scroll (reached end of page or no new content loaded). Ending scraping.")
+                    self.status_callback("No new content to scroll. Stopping scraping.")
                     break
                 last_height = new_height
 
-                # Deteksi potensi pemblokiran: Jika tidak ada URL baru ditemukan setelah beberapa scroll berturut-turut
-                # Meskipun halaman masih bisa discroll ke bawah, ini bisa menjadi indikasi masalah
-                if self.no_new_urls_consecutive_scrolls >= 5: # Misalnya, 5 scroll tanpa URL baru
-                    self._log("Peringatan: Tidak ada URL Shorts baru yang ditemukan setelah beberapa scroll berturut-turut.")
-                    self._log("Ini mungkin mengindikasikan potensi rate limiting, pemblokiran, atau tidak ada lagi Shorts baru.")
-                    self.status_callback("Peringatan: Potensi pemblokiran terdeteksi. Melanjutkan dengan hati-hati.")
-                    # Kita bisa memilih untuk menghentikan atau melanjutkan
-                    # Untuk saat ini, kita akan teruskan, tapi log ini akan muncul
-                    # Jika counter terus bertambah, kemungkinan besar memang tidak ada konten baru.
-                    if self.no_new_urls_consecutive_scrolls >= 10: # Hentikan jika terlalu lama tidak ada URL baru
-                        self._log("Menghentikan scraping karena terlalu banyak scroll tanpa menemukan URL baru.")
-                        self.status_callback("Dihentikan: Tidak ada URL baru ditemukan setelah banyak scroll.")
+                if self.no_new_urls_consecutive_scrolls >= 5:
+                    self._log("Warning: No new Shorts URLs found after several consecutive scrolls.")
+                    self._log("This might indicate potential rate limiting, blocking, or no more new Shorts.")
+                    self.status_callback("Warning: Potential blocking detected. Proceeding cautiously.")
+                    if self.no_new_urls_consecutive_scrolls >= 10:
+                        self._log("Stopping scraping due to too many scrolls without finding new URLs.")
+                        self.status_callback("Stopped: No new URLs found after many scrolls.")
                         break
 
+            self._log("Scraping phase completed.")
+            self.status_callback("Scraping phase completed.")
+            return True # Indicate scraping was successful
+
+        except Exception as e:
+            self._log(f"Error during scraping phase: {e}")
+            self.status_callback(f"Error during scraping: {e}")
+            return False # Indicate scraping failed
+
+        finally:
+            self._quit_driver() # Ensure driver is closed after scraping phase
+
+    def _get_descriptions_phase(self):
+        """
+        Visits each scraped video URL to get its description.
+        """
+        if not self.scraped_data:
+            self._log("No videos scraped to get descriptions for.")
+            self.status_callback("No videos for description retrieval.")
+            return False
+
+        self._log("Starting video description retrieval phase...")
+        self.status_callback("Retrieving video descriptions...")
+        
+        # Re-initialize driver for description retrieval
+        try:
+            self._initialize_webdriver()
+            if not self.driver:
+                self._log("Failed to re-initialize WebDriver for description retrieval.")
+                return False
+        except Exception as e:
+            self._log(f"Failed to re-initialize WebDriver for description retrieval: {e}")
+            self.status_callback("Error: Cannot get descriptions (browser issue).")
+            return False
+
+        # Keep track of the original window handle
+        original_window_handle = self.driver.current_window_handle
+
+        for i, item in enumerate(self.scraped_data):
+            if self.stop_scraping_flag.is_set():
+                self._log("Description retrieval cancelled.")
+                self.status_callback("Description retrieval cancelled.")
+                return False
+
+            self.status_callback(f"Getting description {i+1}/{len(self.scraped_data)} for {item['Title']}...")
+            self._log(f"Getting description for: {item['URL Video']}")
+            
+            # Navigate to the video URL to get description
+            try:
+                item["Description"] = self._get_video_description(item["URL Video"])
             except Exception as e:
-                self._log(f"Error saat mencari elemen video atau memproses data: {e}")
-                self.status_callback(f"Error: {e}")
+                self._log(f"Failed to get description for {item['URL Video']}: {e}")
+                item["Description"] = "" # Set to empty if error
+
+            # After getting description, try to close any new tabs opened and return to original
+            if len(self.driver.window_handles) > 1:
+                for handle in self.driver.window_handles:
+                    if handle != original_window_handle:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                self.driver.switch_to.window(original_window_handle)
+            
+            # Add a small delay between description fetches
+            time.sleep(random.uniform(1, 3)) # Random delay for description fetching
+
+        self._log("Video description retrieval completed.")
+        self.status_callback("Video description retrieval completed.")
+        self._quit_driver() # Quit driver after description phase
+        return True
+
+    def _download_videos(self):
+        """
+        Downloads Shorts videos using yt-dlp.
+        """
+        if not self.scraped_data:
+            self._log("No videos to download.")
+            self.status_callback("No videos to download.")
+            return
+
+        self._log("Starting video download process...")
+        self.status_callback("Starting download process...")
+        self.download_errors = [] # Reset error list for this download attempt
+
+        batch_size = self.config["batch_size"]
+        total_videos = len(self.scraped_data)
+        
+        # Ensure 'Download_Status' is reset to 'N' for any video that was not previously downloaded
+        # or for retries to ensure they are marked 'N' before attempting 'D' or 'E'
+        for item in self.scraped_data:
+            if item["Download_Status"] != "D": # Only reset if not already downloaded
+                item["Download_Status"] = "N"
+
+        for retry_attempt in range(self.config["download_retries"]):
+            if self.stop_scraping_flag.is_set():
+                self._log("Download process cancelled by user during retry loop.")
+                self.status_callback("Download Cancelled.")
                 break
 
-        self.status_callback("Scraping selesai.")
-        self._log("Proses scraping selesai.")
+            self._log(f"Starting download retry attempt {retry_attempt + 1}...")
+            videos_to_download_in_this_attempt = [
+                item for item in self.scraped_data if item["Download_Status"] == "N" or item["Download_Status"] == "E"
+            ]
+
+            if not videos_to_download_in_this_attempt:
+                self._log("All specified videos have been successfully downloaded or no new videos to attempt.")
+                break # All done or no new videos to process
+
+            current_batch_num = 1
+            processed_in_this_attempt = 0
+
+            for i in range(0, len(videos_to_download_in_this_attempt), batch_size):
+                if self.stop_scraping_flag.is_set():
+                    self._log("Download process cancelled by user during batch loop.")
+                    self.status_callback("Download Cancelled.")
+                    break
+
+                batch_videos = videos_to_download_in_this_attempt[i : i + batch_size]
+                batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}")
+                os.makedirs(batch_folder_name, exist_ok=True)
+                self._log(f"Starting download for batch {current_batch_num} to folder: {batch_folder_name}")
+                self.status_callback(f"Downloading batch {current_batch_num} (Retry {retry_attempt + 1})...")
+
+                for video_data in batch_videos:
+                    if self.stop_scraping_flag.is_set():
+                        break
+
+                    video_url = video_data["URL Video"]
+                    video_title = video_data["Title"] if video_data["Title"] else f"Untitled Video {int(time.time())}"
+                    # Sanitize title for filename
+                    sanitized_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+                    sanitized_title = sanitized_title.replace(" ", "_") # Replace spaces with underscores
+                    if not sanitized_title:
+                        sanitized_title = f"Untitled_Video_{hash(video_url) % 100000}" # Fallback if title is empty/invalid
+                    sanitized_title = sanitized_title[:100] # Limit filename length
+
+                    self.status_callback(f"Downloading '{sanitized_title}'...")
+                    self._log(f"Attempting to download: {video_url} - {sanitized_title}")
+
+                    download_command = ["yt-dlp"]
+                    
+                    # Add quality/format options
+                    quality_map = {
+                        "Best Quality": "bestvideo+bestaudio/best",
+                        "Best Quality format mp4": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+                        "Best Quality format mkv": "bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=mkv]",
+                        "1080p format mp4": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]",
+                        "1080p format mkv": "bestvideo[height<=1080][ext=webm]+bestaudio[ext=webm]/best[height<=1080][ext=mkv]",
+                        "720p format mp4": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]",
+                        "720p format mkv": "bestvideo[height<=720][ext=webm]+bestaudio[ext=webm]/best[height<=720][ext=mkv]"
+                    }
+                    download_format_string = quality_map.get(self.config["download_quality"], "best")
+                    download_command.extend(["-f", download_format_string])
+                    
+                    download_command.extend(["--output", os.path.join(batch_folder_name, f"{sanitized_title}.%(ext)s"), video_url])
+                    download_command.append("--no-playlist") # Ensure only single video is downloaded
+
+                    try:
+                        # Execute yt-dlp
+                        result = subprocess.run(download_command, capture_output=True, text=True, check=True, encoding='utf-8', timeout=self.config["download_delay"] * 5) # Timeout is 5x download delay
+                        self._log(f"Successfully downloaded: {video_url}")
+                        self._log(f"yt-dlp Output: {result.stdout.strip()}")
+                        video_data["Download_Status"] = "D" # Downloaded
+                        processed_in_this_attempt += 1
+                    except subprocess.CalledProcessError as e:
+                        self._log(f"Error downloading {video_url}: {e.stderr.strip()}")
+                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: {e.stderr.strip()}\n")
+                        video_data["Download_Status"] = "E" # Error
+                    except FileNotFoundError:
+                        self._log("Error: yt-dlp (or youtube-dl) not found. Make sure it is installed and in your system PATH.")
+                        self.status_callback("Error: Downloader not found. Download halted.")
+                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: Downloader not found (yt-dlp or youtube-dl).\n")
+                        self.stop_scraping_flag.set() # Stop process if downloader is missing
+                        break # Exit inner loop
+                    except TimeoutError:
+                        self._log(f"Download timed out for {video_url}.")
+                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: Download timed out.\n")
+                        video_data["Download_Status"] = "E"
+                    except Exception as e:
+                        self._log(f"Unexpected error while downloading {video_url}: {e}")
+                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: {e}\n")
+                        video_data["Download_Status"] = "E"
+
+                    # Random delay between downloads
+                    if self.config["download_delay"] > 0 and not self.stop_scraping_flag.is_set():
+                        dl_delay = random.randint(1, self.config["download_delay"])
+                        self._log(f"Waiting {dl_delay} seconds (random delay before next download).")
+                        time.sleep(dl_delay)
+
+                current_batch_num += 1
+                if self.stop_scraping_flag.is_set():
+                    break # Exit batch loop if cancellation requested
+
+            if self.stop_scraping_flag.is_set():
+                break # Exit retry loop if cancellation requested
+
+            # If all videos were successfully downloaded in this attempt, break out of retry loop
+            if all(item["Download_Status"] == "D" for item in self.scraped_data):
+                 self._log("All videos successfully downloaded across all retries.")
+                 break
+            else:
+                self._log(f"Download attempt {retry_attempt + 1} finished. Remaining videos to download: {sum(1 for item in self.scraped_data if item['Download_Status'] != 'D')}")
+                if retry_attempt < self.config["download_retries"] - 1:
+                    self._log("Waiting before next download retry...")
+                    time.sleep(self.config["download_delay"] * 2) # Longer delay between full retries
+
+        self._log("Video download process completed.")
+        self.status_callback("Download completed.")
+
 
     def run_scraper(self):
         """
-        Menjalankan seluruh proses scraping, termasuk inisialisasi browser, scraping,
-        dan penanganan retry.
+        Runs the entire process: scraping, description retrieval, and downloading.
         """
-        for retry_attempt in range(self.config["number_of_retries"]):
+        self.start_time = time.time() # Start global timer
+
+        # Phase 1: Scraping
+        scraping_successful = False # Initialize flag
+        for retry_attempt in range(self.config["download_retries"]): # Still using download_retries for the main loop, if scraping fails, we want to retry the whole thing.
             if self.stop_scraping_flag.is_set():
                 break
-
-            self._log(f"Memulai percobaan scraping ke-{retry_attempt + 1} dari {self.config['number_of_retries']}...")
-            self.status_callback(f"Memulai percobaan scraping ke-{retry_attempt + 1}...")
-            self.scraped_data = [] # Reset data untuk setiap percobaan
-            self.scroll_count = 0 # Reset scroll count untuk setiap percobaan
-            self.start_time = None # Reset start time
-            self.no_new_urls_consecutive_scrolls = 0 # Reset counter
-
+            
+            self._log(f"Attempting to start browser and scrape (Trial {retry_attempt + 1})...")
+            self.status_callback(f"Starting browser & scraping (Trial {retry_attempt + 1})...")
+            
             try:
-                self._initialize_webdriver()
-                if not self.driver: # Jika inisialisasi driver gagal, lewati percobaan ini
-                    continue
+                # Initialize driver here, so each retry gets a fresh driver
+                self._initialize_webdriver() 
+                if not self.driver: # Check if driver failed to initialize
+                    self._log("WebDriver initialization failed. Retrying...")
+                    continue # Skip to next retry attempt
 
-                self.driver.get(self.config["channel_url"])
-                # Tunggu hingga elemen body atau elemen penting lainnya muncul
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-                self._log(f"Berhasil membuka URL: {self.config['channel_url']}")
-                self.status_callback("Membuka URL channel...")
-
-                self._scrape_shorts_data()
-
-                if len(self.scraped_data) > 0:
-                    self._log("Scraping berhasil pada percobaan ini.")
-                    break # Berhasil, keluar dari loop retry
+                # If driver initialized, proceed with scraping
+                scraping_successful = self._scrape_shorts_data_phase()
+                if scraping_successful:
+                    self._log("Scraping phase completed successfully.")
+                    break # Exit retry loop if scraping succeeded
                 else:
-                    self._log("Tidak ada URL Shorts ditemukan pada percobaan ini. Mengulang...")
-                    self.status_callback("Tidak ada URL ditemukan. Mengulang...")
+                    self._log("Scraping phase failed or yielded no data. Retrying...")
+                    # The _scrape_shorts_data_phase itself handles closing the driver.
+                    # If it returns False, it means there was an issue, so we retry.
 
-            except TimeoutException:
-                self._log("Timeout saat memuat halaman atau mencari elemen.")
-                self.status_callback("Error: Timeout saat memuat halaman. Coba lagi...")
-            except WebDriverException as e:
-                self._log(f"Kesalahan WebDriver: {e}")
-                self.status_callback(f"Error WebDriver: {e}. Coba lagi...")
             except Exception as e:
-                self._log(f"Terjadi kesalahan tak terduga: {e}")
-                self.status_callback(f"Error tak terduga: {e}. Coba lagi...")
+                self._log(f"An unexpected error occurred during scraping phase setup or execution: {e}")
+                self.status_callback(f"Error during scraping setup: {e}. Retrying...")
             finally:
-                self._quit_driver() # Pastikan driver ditutup setiap kali setelah percobaan
+                # Ensure driver is always quit if it was initialized, before the next retry
+                if self.driver:
+                    self._quit_driver()
+        
+        # After the retry loop, check if scraping was successful
+        if not scraping_successful or self.stop_scraping_flag.is_set():
+            self._log("Scraping phase failed after all retries or was cancelled.")
+            self._display_final_stats() # Show stats even if scraping failed or cancelled
+            return # Exit if scraping failed or cancelled
 
-        # Tampilkan statistik akhir setelah semua percobaan selesai
+        # Phase 2: Description Retrieval
+        self.status_callback("Starting description retrieval phase...")
+        description_successful = self._get_descriptions_phase()
+
+        if not description_successful or self.stop_scraping_flag.is_set():
+            self._display_final_stats() # Show stats even if description retrieval failed or cancelled
+            return # Exit if description retrieval failed or cancelled
+
+        # Phase 3: Download (with retries)
+        if self.scraped_data:
+            self._download_videos()
+        else:
+            self._log("No videos to download after scraping and description retrieval phases.")
+
+        # Save final results and display stats
+        self._save_final_results()
         self._display_final_stats()
+
+
+    def _save_final_results(self):
+        """
+        Saves all final results to a comprehensive TXT file, batch Excel files, and download error file.
+        """
+        self._log("Saving final scraping and download results...")
+        os.makedirs(self.output_folder, exist_ok=True)
+
+        # Save all_scraped_details.txt
+        all_details_txt_path = os.path.join(self.output_folder, "all_scraped_details.txt")
+        with open(all_details_txt_path, "w", encoding="utf-8") as f:
+            for item in self.scraped_data:
+                # Ensure no None values for output
+                url_val = item.get("URL Video", "")
+                title_val = item.get("Title", "")
+                desc_val = item.get("Description", "")
+                f.write(f"{url_val} | {title_val} | {desc_val}\n")
+        self._log(f"All URL, Title, Description details saved to: {all_details_txt_path}")
+
+        # Save batch Excel files
+        batch_size = self.config["batch_size"]
+        total_videos = len(self.scraped_data)
+        current_batch_num = 1
+        for i in range(0, total_videos, batch_size):
+            batch_videos = self.scraped_data[i : i + batch_size]
+            batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}")
+            os.makedirs(batch_folder_name, exist_ok=True) # Ensure batch folder exists
+            xlsx_path = os.path.join(batch_folder_name, f"YouTube_Shorts_Batch_{current_batch_num}.xlsx")
+            
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = f"Batch {current_batch_num} Shorts"
+            sheet.append(["Video URL", "Title", "Description", "Download Status (D/N/E)"])
+            for item in batch_videos:
+                # Ensure no None values for output
+                url_val = item.get("URL Video", "")
+                title_val = item.get("Title", "")
+                desc_val = item.get("Description", "")
+                status_val = item.get("Download_Status", "N") # Default to Not Downloaded
+                sheet.append([url_val, title_val, desc_val, status_val])
+            workbook.save(xlsx_path)
+            self._log(f"Batch {current_batch_num} details saved to: {xlsx_path}")
+            current_batch_num += 1
+
+        # Save error file
+        if self.download_errors:
+            error_file_path = os.path.join(self.output_folder, "download_errors.txt")
+            with open(error_file_path, "w", encoding="utf-8") as f:
+                for error_entry in self.download_errors:
+                    f.write(error_entry + "\n" + "="*50 + "\n")
+            self._log(f"Download error details saved to: {error_file_path}")
+        else:
+            self._log("No download errors recorded.")
+
+        self._log("Final results saving completed.")
+
 
     def _display_final_stats(self):
         """
-        Menampilkan statistik akhir proses scraping.
+        Displays final statistics of the scraping and downloading process.
         """
         total_time = "N/A"
         if self.start_time:
             total_time_seconds = time.time() - self.start_time
-            total_time = f"{total_time_seconds:.2f} detik"
+            total_time = f"{total_time_seconds:.2f} seconds"
 
-        self._log(f"\n--- Statistik Akhir ---")
-        self._log(f"Jumlah URL berhasil dikumpulkan: {len(self.scraped_data)}")
-        self._log(f"Waktu proses total: {total_time}")
-        self._log(f"Jumlah scroll dilakukan: {self.scroll_count}")
-        self._log(f"Lokasi folder output: {os.path.abspath(self.output_folder)}")
+        downloaded_count = sum(1 for item in self.scraped_data if item["Download_Status"] == "D")
+        not_downloaded_count = sum(1 for item in self.scraped_data if item["Download_Status"] == "N")
+        error_download_count = sum(1 for item in self.scraped_data if item["Download_Status"] == "E")
+
+        self._log(f"\n--- Final Statistics ---")
+        self._log(f"Total Shorts URLs found: {len(self.scraped_data)}")
+        self._log(f"Successfully Downloaded Videos: {downloaded_count}")
+        self._log(f"Videos Not Downloaded (cancelled/not attempted): {not_downloaded_count}")
+        self._log(f"Videos Failed to Download (Error): {error_download_count}")
+        self._log(f"Total Process Time: {total_time}")
+        self._log(f"Total scrolls performed: {self.scroll_count}")
+        self._log(f"Output folder location: {os.path.abspath(self.output_folder)}")
         self._log(f"----------------------")
 
-        self.status_callback(f"Selesai! {len(self.scraped_data)} URL terkumpul.")
-        self.progress_callback(len(self.scraped_data), len(self.scraped_data)) # Selesaikan progress bar
+        self.status_callback(f"Process Complete! {downloaded_count} videos downloaded. {error_download_count} errors.")
+        self.progress_callback(len(self.scraped_data), len(self.scraped_data)) # Finalize progress bar
 
-        if len(self.scraped_data) > 0:
-            self._save_results()
-            messagebox.showinfo("Scraping Selesai",
-                                f"Scraping selesai!\n"
-                                f"Jumlah URL berhasil dikumpulkan: {len(self.scraped_data)}\n"
-                                f"Waktu proses total: {total_time}\n"
-                                f"Hasil disimpan di: {os.path.abspath(self.output_folder)}")
-        else:
-            messagebox.showwarning("Scraping Selesai",
-                                   "Scraping selesai, namun tidak ada URL Shorts yang ditemukan.")
-
-
-    def _save_results(self):
-        """
-        Menyimpan hasil scraping ke file TXT dan XLSX.
-        """
-        self._log("Menyimpan hasil scraping...")
-        # Pastikan folder output ada
-        os.makedirs(self.output_folder, exist_ok=True)
-
-        # Simpan ke TXT
-        txt_path = os.path.join(self.output_folder, "scraped_urls.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            for item in self.scraped_data:
-                f.write(item["URL Video"] + "\n")
-        self._log(f"URL berhasil disimpan ke: {txt_path}")
-
-        # Simpan ke Excel
-        xlsx_path = os.path.join(self.output_folder, "YouTube_Shorts_Scraped_Details.xlsx")
-        workbook = openpyxl.Workbook()
-        sheet = workbook.active
-        sheet.title = "YouTube Shorts"
-
-        sheet.append(["URL Video", "Title"])
-        for item in self.scraped_data:
-            sheet.append([item["URL Video"], item["Title"]])
-        workbook.save(xlsx_path)
-        self._log(f"Detail berhasil disimpan ke: {xlsx_path}")
-        self.status_callback("Hasil disimpan ke file.")
+        messagebox.showinfo("Process Complete",
+                            f"Scraping & Download Process Complete!\n"
+                            f"Total URLs Found: {len(self.scraped_data)}\n"
+                            f"Videos Successfully Downloaded: {downloaded_count}\n"
+                            f"Videos Failed to Download: {error_download_count}\n"
+                            f"Total Time: {total_time}\n"
+                            f"Results and Logs are in: {os.path.abspath(self.output_folder)}")
 
 
     def _quit_driver(self):
         """
-        Menutup browser Selenium jika sedang berjalan.
+        Closes the Selenium browser if it's running.
         """
         if self.driver:
-            self._log("Menutup browser Selenium...")
+            self._log("Closing Selenium browser...")
             try:
                 self.driver.quit()
-                self._log("Browser berhasil ditutup.")
+                self._log("Browser closed successfully.")
             except WebDriverException as e:
-                self._log(f"Error saat menutup browser: {e}")
+                self._log(f"Error closing browser: {e}")
             finally:
                 self.driver = None
 
     def stop_scraping(self):
         """
-        Mengatur flag untuk menghentikan proses scraping.
+        Sets the flag to stop the scraping/downloading process.
         """
-        self._log("Permintaan untuk menghentikan scraping diterima.")
+        self._log("Request to stop process (scraping/download) received.")
         self.stop_scraping_flag.set()
         self._quit_driver()
 
 
 class ScrapingApp(tk.Tk):
     """
-    Kelas ini mewakili aplikasi GUI utama untuk bot scraping.
+    This class represents the main GUI application for the YouTube Shorts scraper and downloader.
     """
     def __init__(self):
         """
-        Inisialisasi aplikasi GUI.
+        Initializes the GUI application.
         """
         super().__init__()
-        self.title("YouTube Shorts Scraper Bot")
-        self.geometry("800x800") # Tinggi sedikit ditingkatkan untuk area log dan random delay
+        self.title("YouTube Shorts Scraper & Downloader Bot")
+        self.geometry("850x850") # Adjusted height and width
         self.scraper = None
         self.scraping_thread = None
 
@@ -413,51 +681,61 @@ class ScrapingApp(tk.Tk):
 
     def _create_widgets(self):
         """
-        Membuat semua elemen GUI.
+        Creates all GUI elements.
         """
         main_frame = ttk.Frame(self)
         main_frame.pack(pady=10, padx=10, expand=True, fill="both")
 
         # Input Fields Frame
-        input_frame = ttk.LabelFrame(main_frame, text="Pengaturan Umum")
-        input_frame.pack(padx=5, pady=5, fill="x") # Padding disesuaikan
+        input_frame = ttk.LabelFrame(main_frame, text="General Settings")
+        input_frame.pack(padx=5, pady=5, fill="x")
 
         # Output Folder
-        ttk.Label(input_frame, text="Folder Output:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        ttk.Label(input_frame, text="Output Folder:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
         self.output_folder_var = tk.StringVar(value=os.path.join(os.getcwd(), "scraped_results"))
         ttk.Entry(input_frame, textvariable=self.output_folder_var, width=50).grid(row=0, column=1, padx=5, pady=2, sticky="ew")
         ttk.Button(input_frame, text="Browse", command=self._browse_output_folder).grid(row=0, column=2, padx=5, pady=2)
 
         # Channel URL
-        ttk.Label(input_frame, text="URL Channel Shorts:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        ttk.Label(input_frame, text="YouTube Channel URL:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
         self.channel_url_var = tk.StringVar()
         ttk.Entry(input_frame, textvariable=self.channel_url_var, width=50).grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="ew")
 
-        # Jumlah URL Target
-        ttk.Label(input_frame, text="Jumlah URL Video yang Ingin Dikumpulkan (0 = Semua):").grid(row=2, column=0, padx=5, pady=2, sticky="w")
-        self.target_url_count_var = tk.IntVar(value=0)
-        ttk.Entry(input_frame, textvariable=self.target_url_count_var, width=10).grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        # Target Video Count
+        ttk.Label(input_frame, text="Target Video Count (0 = All):").grid(row=2, column=0, padx=5, pady=2, sticky="w")
+        self.target_video_count_var = tk.IntVar(value=0)
+        ttk.Entry(input_frame, textvariable=self.target_video_count_var, width=10).grid(row=2, column=1, padx=5, pady=2, sticky="w")
 
-        # Scroll Delay (Kembali ke satu input bilangan bulat)
-        ttk.Label(input_frame, text="Scroll Delay (detik, akan dirandom dari 1 hingga nilai ini):").grid(row=3, column=0, padx=5, pady=2, sticky="w")
-        self.scroll_delay_var = tk.IntVar(value=5) # Default 5 detik
+        # Scroll Delay
+        ttk.Label(input_frame, text="Scroll Delay (seconds):").grid(row=3, column=0, padx=5, pady=2, sticky="w")
+        self.scroll_delay_var = tk.IntVar(value=5) # Default 5 seconds
         ttk.Entry(input_frame, textvariable=self.scroll_delay_var, width=10).grid(row=3, column=1, padx=5, pady=2, sticky="w")
 
-        # Number of Retries
-        ttk.Label(input_frame, text="Jumlah Percobaan Penuh Scraping:").grid(row=4, column=0, padx=5, pady=2, sticky="w")
-        self.num_retries_var = tk.IntVar(value=1)
-        ttk.Entry(input_frame, textvariable=self.num_retries_var, width=10).grid(row=4, column=1, padx=5, pady=2, sticky="w")
+        # Download Delay
+        ttk.Label(input_frame, text="Download Delay (seconds):").grid(row=4, column=0, padx=5, pady=2, sticky="w")
+        self.download_delay_var = tk.IntVar(value=5) # Default 5 seconds
+        ttk.Entry(input_frame, textvariable=self.download_delay_var, width=10).grid(row=4, column=1, padx=5, pady=2, sticky="w")
+
+        # Download Retries
+        ttk.Label(input_frame, text="Download Retries:").grid(row=5, column=0, padx=5, pady=2, sticky="w")
+        self.download_retries_var = tk.IntVar(value=3) # Default 3 retries
+        ttk.Entry(input_frame, textvariable=self.download_retries_var, width=10).grid(row=5, column=1, padx=5, pady=2, sticky="w")
+        
+        # Download Batch Size
+        ttk.Label(input_frame, text="Download Batch Size:").grid(row=6, column=0, padx=5, pady=2, sticky="w")
+        self.batch_size_var = tk.IntVar(value=20) # Default 20 videos per batch
+        ttk.Entry(input_frame, textvariable=self.batch_size_var, width=10).grid(row=6, column=1, padx=5, pady=2, sticky="w")
 
         # Proxy Input
-        ttk.Label(input_frame, text="Proxy (opsional, ip:port atau user:pass@ip:port):").grid(row=5, column=0, padx=5, pady=2, sticky="w")
+        ttk.Label(input_frame, text="Proxy (optional):").grid(row=7, column=0, padx=5, pady=2, sticky="w")
         self.proxy_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.proxy_var, width=50).grid(row=5, column=1, columnspan=2, padx=5, pady=2, sticky="ew")
+        ttk.Entry(input_frame, textvariable=self.proxy_var, width=50).grid(row=7, column=1, columnspan=2, padx=5, pady=2, sticky="ew")
 
         input_frame.grid_columnconfigure(1, weight=1)
 
         # Selenium Browser Options Frame
-        browser_options_frame = ttk.LabelFrame(main_frame, text="Opsi Browser Selenium")
-        browser_options_frame.pack(padx=5, pady=5, fill="x") # Padding disesuaikan
+        browser_options_frame = ttk.LabelFrame(main_frame, text="Browser Options")
+        browser_options_frame.pack(padx=5, pady=5, fill="x")
 
         self.headless_mode_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(browser_options_frame, text="Headless Mode", variable=self.headless_mode_var).grid(row=0, column=0, padx=5, pady=2, sticky="w")
@@ -476,46 +754,62 @@ class ScrapingApp(tk.Tk):
         self.enable_smooth_scrolling_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(browser_options_frame, text="Enable Smooth Scrolling", variable=self.enable_smooth_scrolling_var).grid(row=2, column=1, padx=5, pady=2, sticky="w")
         self.set_language_en_us_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(browser_options_frame, text="Set Language ke English (US)", variable=self.set_language_en_us_var).grid(row=2, column=2, padx=5, pady=2, sticky="w")
+        ttk.Checkbutton(browser_options_frame, text="Set Language to English (US)", variable=self.set_language_en_us_var).grid(row=2, column=2, padx=5, pady=2, sticky="w")
         self.start_maximized_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(browser_options_frame, text="Start Browser in Maximized Mode", variable=self.start_maximized_var).grid(row=3, column=0, padx=5, pady=2, sticky="w")
 
         # Scrolling Method Dropdown
-        ttk.Label(browser_options_frame, text="Metode Scrolling:").grid(row=4, column=0, padx=5, pady=2, sticky="w")
+        ttk.Label(browser_options_frame, text="Scrolling Method:").grid(row=4, column=0, padx=5, pady=2, sticky="w")
         self.scrolling_method_var = tk.StringVar(value="Send END Key")
         self.scrolling_method_dropdown = ttk.Combobox(browser_options_frame, textvariable=self.scrolling_method_var,
                                                     values=["Send END Key", "Scroll to Bottom (JS)", "Scroll by Viewport (JS)"])
         self.scrolling_method_dropdown.grid(row=4, column=1, padx=5, pady=2, sticky="ew")
-        self.scrolling_method_dropdown.set("Send END Key") # Default value
+        self.scrolling_method_dropdown.set("Send END Key")
+
+        # Download Quality Dropdown
+        ttk.Label(browser_options_frame, text="Download Quality & Format:").grid(row=5, column=0, padx=5, pady=2, sticky="w")
+        self.download_quality_var = tk.StringVar(value="Best Quality")
+        self.download_quality_dropdown = ttk.Combobox(browser_options_frame, textvariable=self.download_quality_var,
+                                                    values=[
+                                                        "Best Quality",
+                                                        "Best Quality format mp4",
+                                                        "Best Quality format mkv",
+                                                        "1080p format mp4",
+                                                        "1080p format mkv",
+                                                        "720p format mp4",
+                                                        "720p format mkv"
+                                                    ])
+        self.download_quality_dropdown.grid(row=5, column=1, padx=5, pady=2, sticky="ew")
+        self.download_quality_dropdown.set("Best Quality")
 
         for i in range(3):
             browser_options_frame.grid_columnconfigure(i, weight=1)
 
-        # Action Buttons (Dipindahkan ke atas log)
+        # Action Buttons (Moved above log)
         button_frame = ttk.Frame(main_frame)
-        button_frame.pack(pady=10, fill="x") # Menggunakan fill="x" agar tombol memanjang
+        button_frame.pack(pady=10, fill="x")
 
-        self.start_button = ttk.Button(button_frame, text="Mulai Scraping", command=self._start_scraping)
-        self.start_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5) # Responsive
-        self.cancel_button = ttk.Button(button_frame, text="Batal/Hentikan", command=self._cancel_scraping, state="disabled")
-        self.cancel_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5) # Responsive
+        self.start_button = ttk.Button(button_frame, text="Start Scraping & Download", command=self._start_scraping)
+        self.start_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5, ipadx=10, ipady=5)
+        self.cancel_button = ttk.Button(button_frame, text="Cancel/Stop", command=self._cancel_scraping, state="disabled")
+        self.cancel_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5, ipadx=10, ipady=5)
         self.reset_button = ttk.Button(button_frame, text="Reset", command=self._reset_gui)
-        self.reset_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5) # Responsive
-        self.open_output_button = ttk.Button(button_frame, text="Buka Folder Output", command=self._open_output_folder)
-        self.open_output_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5) # Responsive
+        self.reset_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5, ipadx=10, ipady=5)
+        self.open_output_button = ttk.Button(button_frame, text="Open Output Folder", command=self._open_output_folder)
+        self.open_output_button.pack(side=tk.LEFT, expand=True, fill="both", padx=5, ipadx=10, ipady=5)
 
-        # Log Area (dipindahkan ke bawah tombol aksi)
-        ttk.Label(main_frame, text="Log Proses:").pack(pady=5, padx=10, fill="x")
-        self.log_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=15, state="disabled") # Tinggi disesuaikan
+        # Log Area (moved below action buttons)
+        ttk.Label(main_frame, text="Process Log:").pack(pady=5, padx=10, fill="x")
+        self.log_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=15, state="disabled")
         self.log_area.pack(pady=5, padx=10, expand=True, fill="both")
 
-        # Progress Bar & Status Area (tetap di bawah log)
+        # Progress Bar & Status Area (below log)
         self.progress_bar_label = ttk.Label(main_frame, text="Progress: 0%")
         self.progress_bar_label.pack(pady=5, padx=10, fill="x")
         self.progress_bar = ttk.Progressbar(main_frame, orient="horizontal", length=600, mode="determinate")
         self.progress_bar.pack(pady=5, padx=10, fill="x")
 
-        self.status_label = ttk.Label(main_frame, text="Status: Siap", anchor="w")
+        self.status_label = ttk.Label(main_frame, text="Status: Ready", anchor="w")
         self.status_label.pack(pady=5, padx=10, fill="x")
 
         # Handle window close event
@@ -523,7 +817,7 @@ class ScrapingApp(tk.Tk):
 
     def _browse_output_folder(self):
         """
-        Membuka dialog untuk memilih folder output.
+        Opens a dialog to select the output folder.
         """
         folder_selected = filedialog.askdirectory()
         if folder_selected:
@@ -531,117 +825,134 @@ class ScrapingApp(tk.Tk):
 
     def _log_to_gui(self, message):
         """
-        Menulis pesan ke area log GUI.
+        Writes messages to the GUI log area.
         """
         self.log_area.config(state="normal")
         self.log_area.insert(tk.END, message + "\n")
         self.log_area.see(tk.END)
         self.log_area.config(state="disabled")
-        self.update_idletasks() # Perbarui GUI segera
+        self.update_idletasks() # Update GUI immediately
 
     def _update_progress(self, current, total):
         """
-        Memperbarui progress bar dan label persentase.
+        Updates the progress bar and percentage label.
 
         Args:
-            current (int): Jumlah URL yang sudah terkumpul.
-            total (int): Jumlah URL target (0 jika tidak ada target).
+            current (int): Number of URLs collected so far.
+            total (int): Target number of URLs (0 if no target).
         """
         if total > 0:
             percentage = (current / total) * 100
             self.progress_bar.config(mode="determinate", value=percentage)
-            self.progress_bar_label.config(text=f"Progress: {percentage:.2f}% ({current}/{total} URL)")
+            self.progress_bar_label.config(text=f"Progress: {percentage:.2f}% ({current}/{total} URLs)")
         else:
-            # Mode indeterminate jika tidak ada target, hanya tampilkan jumlah URL terkumpul
+            # Indeterminate mode if no target, just show current URL count
             self.progress_bar.config(mode="indeterminate")
             if self.progress_bar.cget("mode") == "indeterminate" and self.progress_bar["value"] == 0:
                 self.progress_bar.start() # Start animation for indeterminate mode only if not already started
-            self.progress_bar_label.config(text=f"Progress: Menemukan {current} URL...")
+            self.progress_bar_label.config(text=f"Progress: Found {current} URLs...")
         self.update_idletasks()
 
     def _update_status(self, message):
         """
-        Memperbarui label status di GUI.
+        Updates the status label in the GUI.
         """
         self.status_label.config(text=f"Status: {message}")
         self.update_idletasks()
 
     def _start_scraping(self):
         """
-        Memulai proses scraping dalam thread terpisah.
+        Starts the scraping and downloading process in a separate thread.
         """
-        # Validasi input
+        # Input Validation
         channel_url = self.channel_url_var.get().strip()
         if not channel_url:
-            messagebox.showerror("Input Error", "URL Channel Shorts tidak boleh kosong.")
+            messagebox.showerror("Input Error", "YouTube Channel URL cannot be empty.")
             return
         if not channel_url.startswith("http"):
-            messagebox.showerror("Input Error", "URL Channel Shorts tidak valid. Harus dimulai dengan http:// atau https://")
+            messagebox.showerror("Input Error", "YouTube Channel URL is invalid. Must start with http:// or https://")
             return
 
         try:
-            target_url_count = int(self.target_url_count_var.get())
-            if target_url_count < 0:
-                raise ValueError("Jumlah URL tidak boleh negatif.")
+            target_video_count = int(self.target_video_count_var.get())
+            if target_video_count < 0:
+                raise ValueError("Target Video Count cannot be negative.")
         except ValueError:
-            messagebox.showerror("Input Error", "Jumlah URL Video yang Ingin Dikumpulkan harus berupa angka non-negatif.")
+            messagebox.showerror("Input Error", "Target Video Count must be a non-negative integer.")
             return
 
         try:
-            # Scroll Delay kini bilangan bulat
             scroll_delay = int(self.scroll_delay_var.get())
             if scroll_delay <= 0:
-                raise ValueError("Scroll Delay harus berupa bilangan bulat positif.")
+                raise ValueError("Scroll Delay must be a positive integer.")
         except ValueError as e:
-            messagebox.showerror("Input Error", f"Kesalahan pada Scroll Delay: {e}\nPastikan nilai adalah bilangan bulat positif.")
+            messagebox.showerror("Input Error", f"Scroll Delay error: {e}\nPlease ensure it's a positive integer.")
             return
 
         try:
-            num_retries = int(self.num_retries_var.get())
-            if num_retries < 1:
-                raise ValueError("Jumlah percobaan harus minimal 1.")
+            download_delay = int(self.download_delay_var.get())
+            if download_delay < 0: # Can be 0 for no download delay
+                raise ValueError("Download Delay cannot be negative.")
+        except ValueError as e:
+            messagebox.showerror("Input Error", f"Download Delay error: {e}\nPlease ensure it's a non-negative integer.")
+            return
+
+        try:
+            download_retries = int(self.download_retries_var.get())
+            if download_retries < 0: # 0 retries means only one attempt
+                raise ValueError("Download Retries cannot be negative.")
         except ValueError:
-            messagebox.showerror("Input Error", "Jumlah Percobaan Penuh Scraping harus berupa angka positif.")
+            messagebox.showerror("Input Error", "Download Retries must be a non-negative integer.")
+            return
+        
+        try:
+            batch_size = int(self.batch_size_var.get())
+            if batch_size <= 0:
+                raise ValueError("Download Batch Size must be greater than 0.")
+        except ValueError:
+            messagebox.showerror("Input Error", "Download Batch Size must be a positive integer.")
             return
 
         output_folder = self.output_folder_var.get()
         if not os.path.exists(output_folder):
             try:
                 os.makedirs(output_folder)
-                self._log_to_gui(f"Folder output '{output_folder}' berhasil dibuat.")
+                self._log_to_gui(f"Output folder '{output_folder}' created successfully.")
             except OSError as e:
-                messagebox.showerror("Folder Error", f"Gagal membuat folder output: {e}")
+                messagebox.showerror("Folder Error", f"Failed to create output folder: {e}")
                 return
 
-        self._save_settings() # Simpan pengaturan saat ini
+        self._save_settings() # Save current settings
 
-        # Nonaktifkan tombol Start, aktifkan tombol Cancel
+        # Disable Start button, enable Cancel
         self.start_button.config(state="disabled")
         self.cancel_button.config(state="normal")
         self.reset_button.config(state="disabled")
         self.open_output_button.config(state="disabled")
 
-        # Reset log area dan progress bar
+        # Reset log area and progress bar
         self.log_area.config(state="normal")
         self.log_area.delete(1.0, tk.END)
         self.log_area.config(state="disabled")
         self.progress_bar.config(value=0) # Reset value to 0
-        if target_url_count == 0:
+        if target_video_count == 0:
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start()
         else:
             self.progress_bar.config(mode="determinate")
 
         self.progress_bar_label.config(text="Progress: 0%")
-        self.status_label.config(text="Status: Memulai...")
+        self.status_label.config(text="Status: Starting...")
 
-        # Kumpulkan konfigurasi untuk scraper
+        # Collect configuration for scraper
         config = {
             "output_folder": output_folder,
             "channel_url": channel_url,
-            "target_url_count": target_url_count,
-            "scroll_delay": scroll_delay, # Menggunakan satu nilai scroll delay
-            "number_of_retries": num_retries,
+            "target_video_count": target_video_count,
+            "scroll_delay": scroll_delay,
+            "download_delay": download_delay,
+            "download_retries": download_retries,
+            "batch_size": batch_size,
             "proxy_input": self.proxy_var.get().strip(),
             "headless_mode": self.headless_mode_var.get(),
             "disable_sandbox": self.disable_sandbox_var.get(),
@@ -653,50 +964,52 @@ class ScrapingApp(tk.Tk):
             "enable_smooth_scrolling": self.enable_smooth_scrolling_var.get(),
             "set_language_en_us": self.set_language_en_us_var.get(),
             "start_maximized": self.start_maximized_var.get(),
-            "scrolling_method": self.scrolling_method_var.get()
+            "scrolling_method": self.scrolling_method_var.get(),
+            "download_quality": self.download_quality_var.get()
         }
 
         self.scraper = YouTubeShortsScraper(output_folder, self._log_to_gui, self._update_progress, self._update_status, config)
         self.scraping_thread = threading.Thread(target=self.scraper.run_scraper)
-        self.scraping_thread.daemon = True # Biarkan thread berhenti saat aplikasi ditutup
+        self.scraping_thread.daemon = True # Allow thread to exit when app closes
         self.scraping_thread.start()
 
-        self._update_status("Scraping sedang berjalan...")
+        self._update_status("Process is running...")
 
-        # Monitor thread selesai untuk mengaktifkan kembali tombol
+        # Monitor thread completion to re-enable buttons
         self.after(100, self._check_scraping_completion)
 
     def _check_scraping_completion(self):
         """
-        Memeriksa apakah thread scraping sudah selesai dan mengaktifkan kembali tombol.
+        Checks if the scraping thread has finished and re-enables buttons.
         """
         if self.scraping_thread and not self.scraping_thread.is_alive():
             self._enable_buttons()
-            self.progress_bar.stop() # Pastikan progress bar indeterminate berhenti
+            self.progress_bar.stop() # Ensure indeterminate progress bar stops
         else:
             self.after(100, self._check_scraping_completion)
 
-
     def _cancel_scraping(self):
         """
-        Menghentikan proses scraping.
+        Stops the scraping process.
         """
         if self.scraper:
             self.scraper.stop_scraping()
-            self._log_to_gui("Membatalkan proses scraping...")
-            self._update_status("Scraping dibatalkan.")
+            self._log_to_gui("Process cancelled...")
+            self._update_status("Process cancelled.")
         self._enable_buttons()
-        self.progress_bar.stop() # Pastikan progress bar indeterminate berhenti
+        self.progress_bar.stop() # Ensure indeterminate progress bar stops
 
     def _reset_gui(self):
         """
-        Mengatur ulang semua input field ke nilai default.
+        Resets all input fields to their default values.
         """
         self.output_folder_var.set(os.path.join(os.getcwd(), "scraped_results"))
         self.channel_url_var.set("")
-        self.target_url_count_var.set(0)
-        self.scroll_delay_var.set(5) # Default 5 detik (integer)
-        self.num_retries_var.set(1)
+        self.target_video_count_var.set(0)
+        self.scroll_delay_var.set(5)
+        self.download_delay_var.set(5)
+        self.download_retries_var.set(3)
+        self.batch_size_var.set(20)
         self.proxy_var.set("")
         self.headless_mode_var.set(True)
         self.disable_sandbox_var.set(True)
@@ -709,6 +1022,7 @@ class ScrapingApp(tk.Tk):
         self.set_language_en_us_var.set(True)
         self.start_maximized_var.set(False)
         self.scrolling_method_var.set("Send END Key")
+        self.download_quality_var.set("Best Quality")
 
         self.log_area.config(state="normal")
         self.log_area.delete(1.0, tk.END)
@@ -716,34 +1030,33 @@ class ScrapingApp(tk.Tk):
         self.progress_bar.config(value=0, mode="determinate")
         self.progress_bar.stop()
         self.progress_bar_label.config(text="Progress: 0%")
-        self.status_label.config(text="Status: Siap")
+        self.status_label.config(text="Status: Ready")
 
         self._enable_buttons()
-        self._log_to_gui("GUI telah direset ke pengaturan default.")
+        self._log_to_gui("GUI has been reset to default settings.")
 
     def _open_output_folder(self):
         """
-        Membuka folder output di file explorer sistem.
+        Opens the output folder in the system's file explorer.
         """
         output_folder = self.output_folder_var.get()
         if os.path.exists(output_folder):
             try:
-                # Periksa OS untuk menjalankan perintah yang sesuai
                 if os.name == 'nt':  # Windows
                     os.startfile(output_folder)
                 elif os.name == 'posix': # macOS, Linux, Unix
                     import subprocess
-                    subprocess.call(['xdg-open', output_folder]) # Umum untuk Linux
+                    subprocess.call(['xdg-open', output_folder]) # Common for Linux
                 else:
-                    messagebox.showerror("Error", "Sistem operasi tidak didukung untuk membuka folder secara otomatis. Harap buka secara manual.")
+                    messagebox.showerror("Error", "Operating system not supported for automatic folder opening. Please open manually.")
             except Exception as e:
-                messagebox.showerror("Error", f"Gagal membuka folder: {e}\nHarap buka secara manual: {output_folder}")
+                messagebox.showerror("Error", f"Failed to open folder: {e}\nPlease open manually: {output_folder}")
         else:
-            messagebox.showerror("Error", "Folder output tidak ditemukan. Pastikan sudah ada atau proses scraping sudah selesai.")
+            messagebox.showerror("Error", "Output folder not found. Ensure it exists or the process has completed.")
 
     def _enable_buttons(self):
         """
-        Mengaktifkan kembali tombol Start dan Reset, menonaktifkan tombol Cancel.
+        Re-enables Start and Reset buttons, disables Cancel button.
         """
         self.start_button.config(state="normal")
         self.cancel_button.config(state="disabled")
@@ -752,14 +1065,16 @@ class ScrapingApp(tk.Tk):
 
     def _save_settings(self):
         """
-        Menyimpan pengaturan GUI ke file JSON.
+        Saves GUI settings to a JSON file.
         """
         settings = {
             "output_folder": self.output_folder_var.get(),
             "channel_url": self.channel_url_var.get(),
-            "target_url_count": self.target_url_count_var.get(),
-            "scroll_delay": self.scroll_delay_var.get(), # Hanya satu nilai
-            "num_retries": self.num_retries_var.get(),
+            "target_video_count": self.target_video_count_var.get(),
+            "scroll_delay": self.scroll_delay_var.get(),
+            "download_delay": self.download_delay_var.get(),
+            "download_retries": self.download_retries_var.get(),
+            "batch_size": self.batch_size_var.get(),
             "proxy_input": self.proxy_var.get(),
             "headless_mode": self.headless_mode_var.get(),
             "disable_sandbox": self.disable_sandbox_var.get(),
@@ -771,18 +1086,19 @@ class ScrapingApp(tk.Tk):
             "enable_smooth_scrolling": self.enable_smooth_scrolling_var.get(),
             "set_language_en_us": self.set_language_en_us_var.get(),
             "start_maximized": self.start_maximized_var.get(),
-            "scrolling_method": self.scrolling_method_var.get()
+            "scrolling_method": self.scrolling_method_var.get(),
+            "download_quality": self.download_quality_var.get()
         }
         try:
             with open("scraper_settings.json", "w") as f:
                 json.dump(settings, f, indent=4)
-            self._log_to_gui("Pengaturan berhasil disimpan.")
+            self._log_to_gui("Settings saved successfully.")
         except Exception as e:
-            self._log_to_gui(f"Error menyimpan pengaturan: {e}")
+            self._log_to_gui(f"Error saving settings: {e}")
 
     def _load_saved_settings(self):
         """
-        Memuat pengaturan GUI dari file JSON.
+        Loads GUI settings from a JSON file.
         """
         try:
             if os.path.exists("scraper_settings.json"):
@@ -790,10 +1106,11 @@ class ScrapingApp(tk.Tk):
                     settings = json.load(f)
                 self.output_folder_var.set(settings.get("output_folder", os.path.join(os.getcwd(), "scraped_results")))
                 self.channel_url_var.set(settings.get("channel_url", ""))
-                self.target_url_count_var.set(settings.get("target_url_count", 0))
-                # Ambil nilai default jika tidak ada di settings.json atau jika dulu ada min/max
-                self.scroll_delay_var.set(int(settings.get("scroll_delay", settings.get("max_scroll_delay", 5)))) # Konversi ke int
-                self.num_retries_var.set(settings.get("num_retries", 1))
+                self.target_video_count_var.set(settings.get("target_video_count", 0))
+                self.scroll_delay_var.set(int(settings.get("scroll_delay", 5)))
+                self.download_delay_var.set(int(settings.get("download_delay", 5)))
+                self.download_retries_var.set(int(settings.get("download_retries", 3)))
+                self.batch_size_var.set(settings.get("batch_size", 20))
                 self.proxy_var.set(settings.get("proxy_input", ""))
                 self.headless_mode_var.set(settings.get("headless_mode", True))
                 self.disable_sandbox_var.set(settings.get("disable_sandbox", True))
@@ -806,19 +1123,20 @@ class ScrapingApp(tk.Tk):
                 self.set_language_en_us_var.set(settings.get("set_language_en_us", True))
                 self.start_maximized_var.set(settings.get("start_maximized", False))
                 self.scrolling_method_var.set(settings.get("scrolling_method", "Send END Key"))
-                self._log_to_gui("Pengaturan sebelumnya berhasil dimuat.")
+                self.download_quality_var.set(settings.get("download_quality", "Best Quality"))
+                self._log_to_gui("Previous settings loaded successfully.")
             else:
-                self._log_to_gui("File pengaturan tidak ditemukan. Menggunakan nilai default.")
+                self._log_to_gui("Settings file not found. Using default values.")
         except Exception as e:
-            self._log_to_gui(f"Error memuat pengaturan: {e}. Menggunakan nilai default.")
+            self._log_to_gui(f"Error loading settings: {e}. Using default values.")
 
     def _on_closing(self):
         """
-        Menangani event penutupan jendela GUI.
+        Handles the GUI window close event.
         """
         if self.scraping_thread and self.scraping_thread.is_alive():
-            if messagebox.askyesno("Keluar Aplikasi", "Scraping sedang berjalan. Apakah Anda yakin ingin keluar? Ini akan menghentikan proses scraping."):
-                self._cancel_scraping() # Hentikan scraping jika sedang berjalan
+            if messagebox.askyesno("Exit Application", "Process is running. Are you sure you want to exit? This will stop the process."):
+                self._cancel_scraping() # Stop process if running
                 self.destroy()
         else:
             self.destroy()
