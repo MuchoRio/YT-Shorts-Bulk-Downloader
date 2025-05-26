@@ -153,7 +153,6 @@ class YouTubeShortsScraper:
             except NoSuchElementException:
                 try:
                     # Selector for description in Shorts (might be simple text or in a particular div)
-                    # This might require more specific selectors for Shorts if present
                     description_element = self.driver.find_element(By.CSS_SELECTOR, "ytd-reel-player-overlay-renderer #description-text, ytm-autonav-renderer #description-text")
                 except NoSuchElementException:
                     pass
@@ -179,8 +178,8 @@ class YouTubeShortsScraper:
         self.scroll_count = 0
         self.no_new_urls_consecutive_scrolls = 0
         
-        # Store initial URL to return to
-        initial_channel_url = self.driver.current_url
+        # Store initial URL to return to (used if navigating away for description)
+        # initial_channel_url = self.driver.current_url # Not used directly in loop, just for context
 
         try:
             self._log(f"Starting scraping phase for: {self.config['channel_url']}")
@@ -284,7 +283,8 @@ class YouTubeShortsScraper:
             return False # Indicate scraping failed
 
         finally:
-            self._quit_driver() # Ensure driver is closed after scraping phase
+            # The driver will be quit by the run_full_process method, not here
+            pass 
 
     def _get_descriptions_phase(self):
         """
@@ -316,6 +316,7 @@ class YouTubeShortsScraper:
             if self.stop_scraping_flag.is_set():
                 self._log("Description retrieval cancelled.")
                 self.status_callback("Description retrieval cancelled.")
+                self.driver.quit() # Ensure driver is closed if cancelled here
                 return False
 
             self.status_callback(f"Getting description {i+1}/{len(self.scraped_data)} for {item['Title']}...")
@@ -329,6 +330,7 @@ class YouTubeShortsScraper:
                 item["Description"] = "" # Set to empty if error
 
             # After getting description, try to close any new tabs opened and return to original
+            # This is important if YouTube opens video in a new tab/window which happens rarely
             if len(self.driver.window_handles) > 1:
                 for handle in self.driver.window_handles:
                     if handle != original_window_handle:
@@ -366,13 +368,14 @@ class YouTubeShortsScraper:
             if item["Download_Status"] != "D": # Only reset if not already downloaded
                 item["Download_Status"] = "N"
 
-        for retry_attempt in range(self.config["download_retries"]):
+        for retry_attempt in range(self.config["download_retries"] + 1): # +1 for initial attempt
             if self.stop_scraping_flag.is_set():
                 self._log("Download process cancelled by user during retry loop.")
                 self.status_callback("Download Cancelled.")
                 break
 
-            self._log(f"Starting download retry attempt {retry_attempt + 1}...")
+            self._log(f"Starting download attempt {retry_attempt + 1}...")
+            # Filter videos that are not yet successfully downloaded
             videos_to_download_in_this_attempt = [
                 item for item in self.scraped_data if item["Download_Status"] == "N" or item["Download_Status"] == "E"
             ]
@@ -382,8 +385,7 @@ class YouTubeShortsScraper:
                 break # All done or no new videos to process
 
             current_batch_num = 1
-            processed_in_this_attempt = 0
-
+            
             for i in range(0, len(videos_to_download_in_this_attempt), batch_size):
                 if self.stop_scraping_flag.is_set():
                     self._log("Download process cancelled by user during batch loop.")
@@ -391,10 +393,11 @@ class YouTubeShortsScraper:
                     break
 
                 batch_videos = videos_to_download_in_this_attempt[i : i + batch_size]
-                batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}")
+                # Use current timestamp for batch folder to avoid conflicts if retrying
+                batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 os.makedirs(batch_folder_name, exist_ok=True)
                 self._log(f"Starting download for batch {current_batch_num} to folder: {batch_folder_name}")
-                self.status_callback(f"Downloading batch {current_batch_num} (Retry {retry_attempt + 1})...")
+                self.status_callback(f"Downloading batch {current_batch_num} (Attempt {retry_attempt + 1})...")
 
                 for video_data in batch_videos:
                     if self.stop_scraping_flag.is_set():
@@ -414,6 +417,16 @@ class YouTubeShortsScraper:
 
                     download_command = ["yt-dlp"]
                     
+                    # Add cookies file path if provided
+                    if self.config["cookies_file_path"]:
+                        # Validate cookies file exists before adding to command
+                        if os.path.exists(self.config["cookies_file_path"]):
+                            download_command.extend(["--cookies", self.config["cookies_file_path"]])
+                            self._log(f"Using cookies from: {self.config['cookies_file_path']}")
+                        else:
+                            self._log(f"Warning: Cookies file not found at {self.config['cookies_file_path']}. Proceeding without cookies.")
+
+
                     # Add quality/format options
                     quality_map = {
                         "Best Quality": "bestvideo+bestaudio/best",
@@ -429,17 +442,29 @@ class YouTubeShortsScraper:
                     
                     download_command.extend(["--output", os.path.join(batch_folder_name, f"{sanitized_title}.%(ext)s"), video_url])
                     download_command.append("--no-playlist") # Ensure only single video is downloaded
+                    download_command.append("--retries") # Add retries for individual download attempts
+                    download_command.append("5") # Example: 5 retries for each video
 
                     try:
                         # Execute yt-dlp
-                        result = subprocess.run(download_command, capture_output=True, text=True, check=True, encoding='utf-8', timeout=self.config["download_delay"] * 5) # Timeout is 5x download delay
+                        result = subprocess.run(
+                            download_command,
+                            capture_output=True,
+                            text=False, # Important: Read raw bytes
+                            check=True,
+                            timeout=self.config["download_delay"] * 5, # Timeout is 5x download delay
+                            encoding=None # Ensure no automatic decoding here
+                        )
                         self._log(f"Successfully downloaded: {video_url}")
-                        self._log(f"yt-dlp Output: {result.stdout.strip()}")
+                        # Decode stdout with error handling for logging
+                        self._log(f"yt-dlp Output: {result.stdout.decode(errors='ignore').strip()}") 
                         video_data["Download_Status"] = "D" # Downloaded
-                        processed_in_this_attempt += 1
+
                     except subprocess.CalledProcessError as e:
-                        self._log(f"Error downloading {video_url}: {e.stderr.strip()}")
-                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: {e.stderr.strip()}\n")
+                        # Decode stderr with error handling, handle None case
+                        err_msg = e.stderr.decode(errors='ignore').strip() if e.stderr else "No error message"
+                        self._log(f"Error downloading {video_url}: {err_msg}")
+                        self.download_errors.append(f"URL: {video_url}\nTitle: {video_title}\nError: {err_msg}\n")
                         video_data["Download_Status"] = "E" # Error
                     except FileNotFoundError:
                         self._log("Error: yt-dlp (or youtube-dl) not found. Make sure it is installed and in your system PATH.")
@@ -475,23 +500,26 @@ class YouTubeShortsScraper:
                  break
             else:
                 self._log(f"Download attempt {retry_attempt + 1} finished. Remaining videos to download: {sum(1 for item in self.scraped_data if item['Download_Status'] != 'D')}")
-                if retry_attempt < self.config["download_retries"] - 1:
+                if retry_attempt < self.config["download_retries"]: # Changed from -1 to just < download_retries
                     self._log("Waiting before next download retry...")
                     time.sleep(self.config["download_delay"] * 2) # Longer delay between full retries
 
         self._log("Video download process completed.")
         self.status_callback("Download completed.")
 
-
-    def run_scraper(self):
+    # --- Renamed from run_scraper to run_full_process ---
+    def run_full_process(self):
         """
         Runs the entire process: scraping, description retrieval, and downloading.
+        This method is called from the GUI thread.
         """
         self.start_time = time.time() # Start global timer
 
         # Phase 1: Scraping
-        scraping_successful = False # Initialize flag
-        for retry_attempt in range(self.config["download_retries"]): # Still using download_retries for the main loop, if scraping fails, we want to retry the whole thing.
+        scraping_successful = False
+        # Allow 1 initial attempt + X retries for scraping/driver init
+        # Use config["download_retries"] for the number of retries, meaning total attempts = retries + 1
+        for retry_attempt in range(self.config["download_retries"] + 1): 
             if self.stop_scraping_flag.is_set():
                 break
             
@@ -503,6 +531,7 @@ class YouTubeShortsScraper:
                 self._initialize_webdriver() 
                 if not self.driver: # Check if driver failed to initialize
                     self._log("WebDriver initialization failed. Retrying...")
+                    time.sleep(self.config["scroll_delay"] * 2) # Add a delay before retrying driver init
                     continue # Skip to next retry attempt
 
                 # If driver initialized, proceed with scraping
@@ -513,11 +542,12 @@ class YouTubeShortsScraper:
                 else:
                     self._log("Scraping phase failed or yielded no data. Retrying...")
                     # The _scrape_shorts_data_phase itself handles closing the driver.
-                    # If it returns False, it means there was an issue, so we retry.
+                    time.sleep(self.config["scroll_delay"] * 2) # Delay before retrying scraping
 
             except Exception as e:
                 self._log(f"An unexpected error occurred during scraping phase setup or execution: {e}")
                 self.status_callback(f"Error during scraping setup: {e}. Retrying...")
+                time.sleep(self.config["scroll_delay"] * 2) # Delay before retrying after an exception
             finally:
                 # Ensure driver is always quit if it was initialized, before the next retry
                 if self.driver:
@@ -572,7 +602,8 @@ class YouTubeShortsScraper:
         current_batch_num = 1
         for i in range(0, total_videos, batch_size):
             batch_videos = self.scraped_data[i : i + batch_size]
-            batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}")
+            # Use current timestamp for batch folder to avoid conflicts if retrying
+            batch_folder_name = os.path.join(self.output_folder, f"batch_{current_batch_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             os.makedirs(batch_folder_name, exist_ok=True) # Ensure batch folder exists
             xlsx_path = os.path.join(batch_folder_name, f"YouTube_Shorts_Batch_{current_batch_num}.xlsx")
             
@@ -672,7 +703,7 @@ class ScrapingApp(tk.Tk):
         """
         super().__init__()
         self.title("YouTube Shorts Scraper & Downloader Bot")
-        self.geometry("850x850") # Adjusted height and width
+        self.geometry("850x880") # Adjusted height for new cookies input
         self.scraper = None
         self.scraping_thread = None
 
@@ -730,6 +761,13 @@ class ScrapingApp(tk.Tk):
         ttk.Label(input_frame, text="Proxy (optional):").grid(row=7, column=0, padx=5, pady=2, sticky="w")
         self.proxy_var = tk.StringVar()
         ttk.Entry(input_frame, textvariable=self.proxy_var, width=50).grid(row=7, column=1, columnspan=2, padx=5, pady=2, sticky="ew")
+
+        # Cookies File Path Input
+        ttk.Label(input_frame, text="Cookies File (.txt) Path (optional):").grid(row=8, column=0, padx=5, pady=2, sticky="w")
+        self.cookies_file_path_var = tk.StringVar()
+        ttk.Entry(input_frame, textvariable=self.cookies_file_path_var, width=50).grid(row=8, column=1, padx=5, pady=2, sticky="ew")
+        ttk.Button(input_frame, text="Browse", command=self._browse_cookies_file).grid(row=8, column=2, padx=5, pady=2)
+
 
         input_frame.grid_columnconfigure(1, weight=1)
 
@@ -822,6 +860,14 @@ class ScrapingApp(tk.Tk):
         folder_selected = filedialog.askdirectory()
         if folder_selected:
             self.output_folder_var.set(folder_selected)
+
+    def _browse_cookies_file(self):
+        """
+        Opens a file dialog to select the cookies .txt file.
+        """
+        file_selected = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if file_selected:
+            self.cookies_file_path_var.set(file_selected)
 
     def _log_to_gui(self, message):
         """
@@ -922,6 +968,11 @@ class ScrapingApp(tk.Tk):
                 messagebox.showerror("Folder Error", f"Failed to create output folder: {e}")
                 return
 
+        cookies_file_path = self.cookies_file_path_var.get().strip()
+        if cookies_file_path and not os.path.exists(cookies_file_path):
+            messagebox.showwarning("File Warning", f"Cookies file not found at: {cookies_file_path}\nProceeding without cookies for yt-dlp.")
+            cookies_file_path = "" # Clear invalid path
+
         self._save_settings() # Save current settings
 
         # Disable Start button, enable Cancel
@@ -965,11 +1016,13 @@ class ScrapingApp(tk.Tk):
             "set_language_en_us": self.set_language_en_us_var.get(),
             "start_maximized": self.start_maximized_var.get(),
             "scrolling_method": self.scrolling_method_var.get(),
-            "download_quality": self.download_quality_var.get()
+            "download_quality": self.download_quality_var.get(),
+            "cookies_file_path": cookies_file_path # Pass cookies file path to scraper
         }
 
         self.scraper = YouTubeShortsScraper(output_folder, self._log_to_gui, self._update_progress, self._update_status, config)
-        self.scraping_thread = threading.Thread(target=self.scraper.run_scraper)
+        # --- PERBAIKAN DI SINI: Panggil run_full_process ---
+        self.scraping_thread = threading.Thread(target=self.scraper.run_full_process)
         self.scraping_thread.daemon = True # Allow thread to exit when app closes
         self.scraping_thread.start()
 
@@ -1011,6 +1064,7 @@ class ScrapingApp(tk.Tk):
         self.download_retries_var.set(3)
         self.batch_size_var.set(20)
         self.proxy_var.set("")
+        self.cookies_file_path_var.set("") # Reset cookies path
         self.headless_mode_var.set(True)
         self.disable_sandbox_var.set(True)
         self.disable_dev_shm_usage_var.set(False)
@@ -1076,6 +1130,7 @@ class ScrapingApp(tk.Tk):
             "download_retries": self.download_retries_var.get(),
             "batch_size": self.batch_size_var.get(),
             "proxy_input": self.proxy_var.get(),
+            "cookies_file_path": self.cookies_file_path_var.get(), # Save cookies path
             "headless_mode": self.headless_mode_var.get(),
             "disable_sandbox": self.disable_sandbox_var.get(),
             "disable_dev_shm_usage": self.disable_dev_shm_usage_var.get(),
@@ -1112,6 +1167,7 @@ class ScrapingApp(tk.Tk):
                 self.download_retries_var.set(int(settings.get("download_retries", 3)))
                 self.batch_size_var.set(settings.get("batch_size", 20))
                 self.proxy_var.set(settings.get("proxy_input", ""))
+                self.cookies_file_path_var.set(settings.get("cookies_file_path", "")) # Load cookies path
                 self.headless_mode_var.set(settings.get("headless_mode", True))
                 self.disable_sandbox_var.set(settings.get("disable_sandbox", True))
                 self.disable_dev_shm_usage_var.set(settings.get("disable_dev_shm_usage", False))
