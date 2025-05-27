@@ -18,7 +18,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException, InvalidSessionIdException
 
 from webdriver_manager.chrome import ChromeDriverManager
 import openpyxl
@@ -50,6 +50,33 @@ class YouTubeShortsScraper:
         self.scroll_count = 0
         self.no_new_urls_consecutive_scrolls = 0 # Counter for potential blocking detection
         self.download_errors = [] # List to store video URLs that failed to download
+
+        # User Agent lists (updated and more specific desktop user agents)
+        self.user_agents_map = {
+            "Random Desktop": [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/126.0",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0"
+            ],
+            "Chrome (Desktop)": [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ],
+            "Firefox (Desktop)": [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/126.0",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"
+            ],
+            "Edge (Desktop)": [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+            ]
+        }
+
 
     def _log(self, message):
         """
@@ -96,16 +123,17 @@ class YouTubeShortsScraper:
         if self.config["start_maximized"]:
             options.add_argument("--start-maximized")
 
-        # Random User-Agent
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36"
-        ]
-        options.add_argument(f"user-agent={random.choice(user_agents)}")
+        # Set User-Agent based on GUI selection
+        selected_ua_type = self.config["user_agent_type"]
+        if selected_ua_type in self.user_agents_map:
+            user_agent = random.choice(self.user_agents_map[selected_ua_type])
+            options.add_argument(f"user-agent={user_agent}")
+            self._log(f"Using User-Agent: {user_agent} (Type: {selected_ua_type})")
+        else:
+            self._log("Warning: Invalid User-Agent type selected. Using default Random Desktop UA.")
+            user_agent = random.choice(self.user_agents_map["Random Desktop"])
+            options.add_argument(f"user-agent={user_agent}")
+
 
         # Proxy Configuration
         if self.config["proxy_input"]:
@@ -117,16 +145,69 @@ class YouTubeShortsScraper:
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
             self.driver.set_page_load_timeout(30) # Set timeout for page loading
+
+            # Load cookies into Selenium browser if path is provided
+            if self.config["cookies_file_path"] and os.path.exists(self.config["cookies_file_path"]):
+                self._log("Attempting to load cookies into Selenium browser.")
+                # Navigate to YouTube domain first to set cookies
+                # Use a generic YouTube URL for cookie loading
+                self.driver.get("http://www.youtube.com") # Navigate to actual YouTube domain [cite: 1]
+                try:
+                    with open(self.config["cookies_file_path"], 'r') as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if not line.strip() or line.startswith('#'):
+                                continue
+                            parts = line.strip().split('\t')
+                            # Netscape cookie file format has 7 parts. [cite: 1, 2, 3]
+                            if len(parts) == 7:
+                                domain = parts[0]
+                                # Replace placeholder domains with actual youtube.com for loading cookies
+                                # This ensures cookies are set to the correct domain in the browser
+                                # The domain in the cookie file should ideally be ".youtube.com" [cite: 1, 2, 3]
+                                # We need to ensure the cookies are set for the real youtube.com domain.
+                                if domain.startswith('.'): # Remove leading dot for Selenium's add_cookie, if present
+                                    domain = domain[1:]
+                                
+                                # For loading, Selenium's domain should be `youtube.com` not `youtube.com` or `www.youtube.com` placeholders [cite: 1, 2, 3]
+                                domain = domain.replace("googleusercontent.com/youtube.com/5", "youtube.com") # Replace placeholder with actual domain [cite: 1, 2, 3]
+                                domain = domain.replace("googleusercontent.com/youtube.com/9", "youtube.com") # Replace placeholder with actual domain [cite: 1, 2, 3]
+                                domain = domain.replace("googleusercontent.com/youtube.com/10", "youtube.com") # Replace placeholder with actual domain [cite: 1, 2, 3]
+                                
+                                cookie = {
+                                    'domain': domain,
+                                    'name': parts[5],
+                                    'value': parts[6],
+                                    'path': parts[2],
+                                    'expiry': int(parts[4]) if parts[4].isdigit() else None,
+                                    'httpOnly': parts[1] == 'TRUE',
+                                    'secure': parts[3] == 'TRUE'
+                                }
+                                # Selenium requires at least name, value, domain, path
+                                # Add only if domain is 'youtube.com' to avoid errors with invalid domains
+                                if 'youtube.com' in cookie['domain']: # Check if it's for YouTube domain
+                                    if cookie['expiry'] is not None and cookie['expiry'] > 0: # Check if expiry is valid and not session cookie
+                                        self.driver.add_cookie(cookie)
+                                    else:
+                                        # Add without expiry if it's invalid or session cookie (expiry 0 or non-digit)
+                                        self.driver.add_cookie({k:v for k,v in cookie.items() if k != 'expiry'})
+                                else:
+                                    self._log(f"Skipping cookie with invalid domain for YouTube: {cookie['domain']}")
+                        self._log("Cookies loaded into Selenium browser.")
+                except Exception as cookie_err:
+                    self._log(f"Error loading cookies into Selenium: {cookie_err}. Proceeding without loaded Selenium cookies.")
+            
             self._log("WebDriver initialized successfully.")
         except WebDriverException as e:
             self._log(f"Error initializing WebDriver: {e}")
             self.status_callback("Error: Failed to initialize browser. Make sure Chrome is installed and up-to-date.")
             self.driver = None # Ensure driver is None if initialization fails
-            raise
+            raise # Re-raise to be caught by run_full_process retry logic
 
     def _get_video_description(self, video_url):
         """
         Visits individual video URL to get the description.
+        Robust to WebDriver issues.
         """
         try:
             self._log(f"Visiting {video_url} to get description...")
@@ -164,131 +245,141 @@ class YouTubeShortsScraper:
             else:
                 self._log("Description not found for this video.")
                 return ""
+        except (WebDriverException, TimeoutException, InvalidSessionIdException) as e:
+            self._log(f"WebDriver error getting description from {video_url}: {e}. Retrying this description attempt or skipping.")
+            # Try to stop page loading to prevent hanging
+            try:
+                self.driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            return "" # Return empty description on WebDriver errors (will trigger retry at phase level)
         except Exception as e:
-            self._log(f"Error getting description from {video_url}: {e}")
+            self._log(f"General error getting description from {video_url}: {e}")
             return ""
 
     def _scrape_shorts_data_phase(self):
         """
         Performs the scraping phase: collecting URLs, Titles, and Descriptions.
         """
-        self.scraped_data = []
-        urls_found_set = set()
-        previous_urls_count = 0
-        self.scroll_count = 0
-        self.no_new_urls_consecutive_scrolls = 0
-        
-        # Store initial URL to return to (used if navigating away for description)
-        # initial_channel_url = self.driver.current_url # Not used directly in loop, just for context
-
+        self._log(f"Starting scraping phase for: {self.config['channel_url']}")
+        self.driver.get(self.config["channel_url"])
         try:
-            self._log(f"Starting scraping phase for: {self.config['channel_url']}")
-            self.driver.get(self.config["channel_url"])
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-            self.status_callback("Scraping: Opening channel URL...")
+        except TimeoutException:
+            self._log("Timeout waiting for channel page to load. Scraping might fail.")
+            return False # Indicate failure
 
-            last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+        self.status_callback("Scraping: Opening channel URL...")
 
-            if self.config["target_video_count"] == 0:
-                self.progress_callback(0, 0) # Indeterminate mode
+        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
 
-            while True:
-                if self.stop_scraping_flag.is_set():
-                    self._log("Scraping process cancelled by user.")
-                    self.status_callback("Scraping Cancelled.")
-                    return False # Indicate scraping was not successful
+        if self.config["target_video_count"] == 0:
+            self.progress_callback(0, 0) # Indeterminate mode
 
-                self.scroll_count += 1
-                self.status_callback(f"Scraping: Scrolling {self.scroll_count}...")
-                self._log(f"Scrolling {self.scroll_count}...")
+        while True:
+            if self.stop_scraping_flag.is_set():
+                self._log("Scraping process cancelled by user.")
+                self.status_callback("Scraping Cancelled.")
+                return False # Indicate scraping was not successful
 
-                # Scrolling method implementation
-                if self.config["scrolling_method"] == "Send END Key":
-                    self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.END)
-                elif self.config["scrolling_method"] == "Scroll to Bottom (JS)":
-                    self.driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                elif self.config["scrolling_method"] == "Scroll by Viewport (JS)":
-                    self.driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
+            self.scroll_count += 1
+            self.status_callback(f"Scraping: Scrolling {self.scroll_count}...")
+            self._log(f"Scrolling {self.scroll_count}...")
 
-                time.sleep(self.config["scroll_delay"]) # Fixed delay
+            # Scrolling method implementation
+            if self.config["scrolling_method"] == "Send END Key":
+                self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.END)
+            elif self.config["scrolling_method"] == "Scroll to Bottom (JS)":
+                self.driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+            elif self.config["scrolling_method"] == "Scroll by Viewport (JS)":
+                self.driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
 
+            time.sleep(self.config["scroll_delay"]) # Fixed delay
+
+            # Re-evaluate video elements on each scroll as page content changes
+            try:
                 video_elements = self.driver.find_elements(By.CSS_SELECTOR,
                     "a.shortsLockupViewModelHostEndpoint.reel-item-endpoint[href*='/shorts/'], " +
                     "a.shortsLockupViewModelHostEndpoint.shortsLockupViewModelHostOutsideMetadataEndpoint[href*='/shorts/']"
                 )
+            except WebDriverException as e:
+                self._log(f"WebDriver error during element finding in scraping: {e}. Attempting to recover...")
+                # If driver crashed, it's safer to restart the scraping phase (handled by run_full_process)
+                return False 
 
-                num_urls_before_current_scan = len(urls_found_set)
+            num_urls_before_current_scan = len(self.scraped_data) # Check against already collected data
 
-                for element in video_elements:
-                    href = element.get_attribute("href")
-                    title = ""
+            for element in video_elements:
+                href = element.get_attribute("href")
+                title = ""
 
-                    if element.get_attribute("title"):
-                        title = element.get_attribute("title").strip()
-                    else:
-                        try:
-                            title_span = element.find_element(By.CSS_SELECTOR, "span.yt-core-attributed-string")
-                            title = title_span.text.strip()
-                        except NoSuchElementException:
-                            pass
-
-                    if href and "/shorts/" in href:
-                        # Ensure URL is absolute
-                        if not href.startswith("http"):
-                            href = urljoin(self.config['channel_url'], href)
-
-                        if href not in urls_found_set:
-                            self.scraped_data.append({"URL Video": href, "Title": title, "Description": "", "Download_Status": "N"})
-                            urls_found_set.add(href)
-                            self._log(f"Found Shorts (URL): {title} ({href})")
-
-                if len(urls_found_set) > num_urls_before_current_scan:
-                    self.no_new_urls_consecutive_scrolls = 0
+                if element.get_attribute("title"):
+                    title = element.get_attribute("title").strip()
                 else:
-                    self.no_new_urls_consecutive_scrolls += 1
+                    try:
+                        title_span = element.find_element(By.CSS_SELECTOR, "span.yt-core-attributed-string")
+                        title = title_span.text.strip()
+                    except NoSuchElementException:
+                        pass
 
-                self._log(f"Total unique URLs found during scraping: {len(urls_found_set)}")
-                self.progress_callback(len(urls_found_set), self.config["target_video_count"])
+                if href and "/shorts/" in href:
+                    # Ensure URL is absolute
+                    if not href.startswith("http"):
+                        href = urljoin(self.config['channel_url'], href)
 
-                if self.config["target_video_count"] > 0 and len(urls_found_set) >= self.config["target_video_count"]:
-                    self._log(f"Target video count ({self.config['target_video_count']}) reached. Stopping scraping.")
-                    self.status_callback("Target video count reached. Stopping scraping.")
+                    # Only add if not already in self.scraped_data to prevent re-adding after scrolling
+                    # This requires checking the URL against existing data
+                    is_new_url = True
+                    for existing_item in self.scraped_data:
+                        if existing_item['URL Video'] == href:
+                            is_new_url = False
+                            break
+                    
+                    if is_new_url:
+                        self.scraped_data.append({"URL Video": href, "Title": title, "Description": "", "Download_Status": "N"})
+                        self._log(f"Found Shorts (URL): {title} ({href})")
+            
+            # Check for new unique URLs found in this scroll
+            current_unique_urls_count = len(self.scraped_data)
+            if current_unique_urls_count > num_urls_before_current_scan:
+                self.no_new_urls_consecutive_scrolls = 0
+            else:
+                self.no_new_urls_consecutive_scrolls += 1
+
+            self._log(f"Total unique URLs found during scraping: {current_unique_urls_count}")
+            self.progress_callback(current_unique_urls_count, self.config["target_video_count"])
+
+            if self.config["target_video_count"] > 0 and current_unique_urls_count >= self.config["target_video_count"]:
+                self._log(f"Target video count ({self.config['target_video_count']}) reached. Stopping scraping.")
+                self.status_callback("Target video count reached. Stopping scraping.")
+                break
+
+            new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+            if new_height == last_height:
+                self._log("No new content to scroll (reached end of page or no new content loaded). Ending scraping.")
+                self.status_callback("No new content to scroll. Stopping scraping.")
+                break
+            last_height = new_height
+
+            if self.no_new_urls_consecutive_scrolls >= 5:
+                self._log("Warning: No new Shorts URLs found after several consecutive scrolls.")
+                self._log("This might indicate potential rate limiting, blocking, or no more new Shorts.")
+                self.status_callback("Warning: Potential blocking detected. Proceeding cautiously.")
+                if self.no_new_urls_consecutive_scrolls >= 10:
+                    self._log("Stopping scraping due to too many scrolls without finding new URLs.")
+                    self.status_callback("Stopped: No new URLs found after many scrolls.")
                     break
 
-                new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-                if new_height == last_height:
-                    self._log("No new content to scroll (reached end of page or no new content loaded). Ending scraping.")
-                    self.status_callback("No new content to scroll. Stopping scraping.")
-                    break
-                last_height = new_height
-
-                if self.no_new_urls_consecutive_scrolls >= 5:
-                    self._log("Warning: No new Shorts URLs found after several consecutive scrolls.")
-                    self._log("This might indicate potential rate limiting, blocking, or no more new Shorts.")
-                    self.status_callback("Warning: Potential blocking detected. Proceeding cautiously.")
-                    if self.no_new_urls_consecutive_scrolls >= 10:
-                        self._log("Stopping scraping due to too many scrolls without finding new URLs.")
-                        self.status_callback("Stopped: No new URLs found after many scrolls.")
-                        break
-
-            self._log("Scraping phase completed.")
-            self.status_callback("Scraping phase completed.")
-            return True # Indicate scraping was successful
-
-        except Exception as e:
-            self._log(f"Error during scraping phase: {e}")
-            self.status_callback(f"Error during scraping: {e}")
-            return False # Indicate scraping failed
-
-        finally:
-            # The driver will be quit by the run_full_process method, not here
-            pass 
+        self._log("Scraping phase completed.")
+        self.status_callback("Scraping phase completed.")
+        return True # Indicate scraping was successful
 
     def _get_descriptions_phase(self):
         """
         Visits each scraped video URL to get its description.
+        Handles potential WebDriver issues during individual video visits.
         """
         if not self.scraped_data:
             self._log("No videos scraped to get descriptions for.")
@@ -298,48 +389,109 @@ class YouTubeShortsScraper:
         self._log("Starting video description retrieval phase...")
         self.status_callback("Retrieving video descriptions...")
         
-        # Re-initialize driver for description retrieval
+        # --- Enhanced Driver Management for Description Phase ---
+        # Initialize driver once at the start of this phase
         try:
             self._initialize_webdriver()
             if not self.driver:
-                self._log("Failed to re-initialize WebDriver for description retrieval.")
+                self._log("Failed to initialize WebDriver for description retrieval at phase start. Stopping phase.")
                 return False
         except Exception as e:
-            self._log(f"Failed to re-initialize WebDriver for description retrieval: {e}")
+            self._log(f"Failed to initialize WebDriver for description retrieval at phase start: {e}. Stopping phase.")
             self.status_callback("Error: Cannot get descriptions (browser issue).")
             return False
 
-        # Keep track of the original window handle
-        original_window_handle = self.driver.current_window_handle
+        original_window_handle = self.driver.current_window_handle # Store initial handle
 
         for i, item in enumerate(self.scraped_data):
             if self.stop_scraping_flag.is_set():
                 self._log("Description retrieval cancelled.")
                 self.status_callback("Description retrieval cancelled.")
-                self.driver.quit() # Ensure driver is closed if cancelled here
-                return False
-
+                break # Exit loop
+            
             self.status_callback(f"Getting description {i+1}/{len(self.scraped_data)} for {item['Title']}...")
             self._log(f"Getting description for: {item['URL Video']}")
             
-            # Navigate to the video URL to get description
-            try:
-                item["Description"] = self._get_video_description(item["URL Video"])
-            except Exception as e:
-                self._log(f"Failed to get description for {item['URL Video']}: {e}")
-                item["Description"] = "" # Set to empty if error
+            description_retrieved = False
+            # Retry mechanism for individual description fetch
+            for desc_retry in range(3): # Try up to 3 times per description
+                if self.stop_scraping_flag.is_set():
+                    break
+                try:
+                    # Check if driver is still valid before attempting to use it
+                    if not self.driver:
+                        self._log(f"Driver is None before description attempt {desc_retry + 1}. Re-initializing...")
+                        self._initialize_webdriver()
+                        if not self.driver:
+                            self._log("Critical: Failed to re-initialize driver. Cannot continue description retrieval.")
+                            self.stop_scraping_flag.set()
+                            break # Exit inner retry loop
 
-            # After getting description, try to close any new tabs opened and return to original
-            # This is important if YouTube opens video in a new tab/window which happens rarely
-            if len(self.driver.window_handles) > 1:
-                for handle in self.driver.window_handles:
-                    if handle != original_window_handle:
-                        self.driver.switch_to.window(handle)
-                        self.driver.close()
-                self.driver.switch_to.window(original_window_handle)
+                    item["Description"] = self._get_video_description(item["URL Video"])
+                    if item["Description"] is not None: # Check if description was successfully attempted
+                        description_retrieved = True
+                        break # Success, break retry loop
+                    self._log(f"Description retrieval attempt {desc_retry + 1} failed for {item['URL Video']}. Retrying...")
+                    time.sleep(1) # Small delay before retrying
+                except (WebDriverException, TimeoutException, InvalidSessionIdException) as e:
+                    self._log(f"WebDriver error during description retrieval for {item['URL Video']} (Attempt {desc_retry+1}): {e}")
+                    # Attempt to re-initialize driver if session is invalid or similar critical error
+                    self._quit_driver()
+                    try:
+                        self._initialize_webdriver()
+                        if not self.driver:
+                            self._log("Critical: Failed to re-initialize driver after error in description phase. Stopping.")
+                            self.status_callback("Critical Error: Browser issue during description retrieval.")
+                            self.stop_scraping_flag.set() # Set flag to stop main process
+                            return False # Cannot continue
+                    except Exception as init_err:
+                        self._log(f"Critical: Double failed to re-initialize driver: {init_err}. Stopping.")
+                        self.status_callback("Critical Error: Browser issue during description retrieval.")
+                        self.stop_scraping_flag.set()
+                        return False
+                except Exception as e:
+                    self._log(f"General error during description retrieval for {item['URL Video']} (Attempt {desc_retry+1}): {e}")
+                    time.sleep(1) # Small delay before retrying
             
-            # Add a small delay between description fetches
-            time.sleep(random.uniform(1, 3)) # Random delay for description fetching
+            if self.stop_scraping_flag.is_set():
+                break # Exit main loop if cancellation detected during retry
+            
+            if not description_retrieved:
+                self._log(f"Failed to retrieve description for {item['URL Video']} after multiple attempts. Skipping.")
+                item["Description"] = "" # Ensure it's empty if all retries fail
+
+            # Clean up windows/tabs and return to a stable state for the next description fetch
+            try:
+                # Close any extra windows/tabs that might have opened
+                if len(self.driver.window_handles) > 1:
+                    for handle in self.driver.window_handles:
+                        if handle != original_window_handle:
+                            self.driver.switch_to.window(handle)
+                            self.driver.close()
+                    self.driver.switch_to.window(original_window_handle)
+                
+                # After returning or if no new windows, ensure we're on a stable page
+                self.driver.get("http://www.youtube.com") # Go to a generic YouTube page to reset context [cite: 1]
+                WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except (WebDriverException, TimeoutException) as e:
+                self._log(f"Warning: Failed to reset browser state after description retrieval for {item['URL Video']}: {e}. Attempting to re-initialize driver.")
+                self._quit_driver() # Quit current problematic driver
+                try:
+                    self._initialize_webdriver() # Re-initialize for next video
+                    if not self.driver:
+                        self._log("Critical: Failed to re-initialize driver after browser state error. Stopping.")
+                        self.status_callback("Critical Error: Browser state issue during description retrieval.")
+                        self.stop_scraping_flag.set()
+                        return False # Cannot continue
+                except Exception as init_err:
+                    self._log(f"Critical: Double failed to re-initialize driver after browser state error: {init_err}. Stopping.")
+                    self.status_callback("Critical Error: Browser state issue during description retrieval.")
+                    self.stop_scraping_flag.set()
+                    return False
+
+
+            # Add a small random delay between description fetches
+            time.sleep(random.uniform(1, 3))
 
         self._log("Video description retrieval completed.")
         self.status_callback("Video description retrieval completed.")
@@ -561,9 +713,10 @@ class YouTubeShortsScraper:
 
         # Phase 2: Description Retrieval
         self.status_callback("Starting description retrieval phase...")
-        description_successful = self._get_descriptions_phase()
+        description_successful = self._get_descriptions_phase() # This phase now handles its own driver init/quit and retries
 
         if not description_successful or self.stop_scraping_flag.is_set():
+            self._log("Description retrieval phase failed or was cancelled.")
             self._display_final_stats() # Show stats even if description retrieval failed or cancelled
             return # Exit if description retrieval failed or cancelled
 
@@ -703,7 +856,7 @@ class ScrapingApp(tk.Tk):
         """
         super().__init__()
         self.title("YouTube Shorts Scraper & Downloader Bot")
-        self.geometry("850x880") # Adjusted height for new cookies input
+        self.geometry("850x910") # Adjusted height for new user agent input
         self.scraper = None
         self.scraping_thread = None
 
@@ -767,6 +920,14 @@ class ScrapingApp(tk.Tk):
         self.cookies_file_path_var = tk.StringVar()
         ttk.Entry(input_frame, textvariable=self.cookies_file_path_var, width=50).grid(row=8, column=1, padx=5, pady=2, sticky="ew")
         ttk.Button(input_frame, text="Browse", command=self._browse_cookies_file).grid(row=8, column=2, padx=5, pady=2)
+
+        # User Agent Type Dropdown
+        ttk.Label(input_frame, text="User Agent Type:").grid(row=9, column=0, padx=5, pady=2, sticky="w")
+        self.user_agent_type_var = tk.StringVar(value="Random Desktop")
+        self.user_agent_type_dropdown = ttk.Combobox(input_frame, textvariable=self.user_agent_type_var,
+                                                     values=["Random Desktop", "Chrome (Desktop)", "Firefox (Desktop)", "Edge (Desktop)"])
+        self.user_agent_type_dropdown.grid(row=9, column=1, padx=5, pady=2, sticky="ew")
+        self.user_agent_type_dropdown.set("Random Desktop")
 
 
         input_frame.grid_columnconfigure(1, weight=1)
@@ -1017,11 +1178,11 @@ class ScrapingApp(tk.Tk):
             "start_maximized": self.start_maximized_var.get(),
             "scrolling_method": self.scrolling_method_var.get(),
             "download_quality": self.download_quality_var.get(),
-            "cookies_file_path": cookies_file_path # Pass cookies file path to scraper
+            "cookies_file_path": cookies_file_path, # Pass cookies file path to scraper
+            "user_agent_type": self.user_agent_type_var.get() # Pass selected user agent type
         }
 
         self.scraper = YouTubeShortsScraper(output_folder, self._log_to_gui, self._update_progress, self._update_status, config)
-        # --- PERBAIKAN DI SINI: Panggil run_full_process ---
         self.scraping_thread = threading.Thread(target=self.scraper.run_full_process)
         self.scraping_thread.daemon = True # Allow thread to exit when app closes
         self.scraping_thread.start()
@@ -1065,6 +1226,7 @@ class ScrapingApp(tk.Tk):
         self.batch_size_var.set(20)
         self.proxy_var.set("")
         self.cookies_file_path_var.set("") # Reset cookies path
+        self.user_agent_type_var.set("Random Desktop") # Reset user agent type
         self.headless_mode_var.set(True)
         self.disable_sandbox_var.set(True)
         self.disable_dev_shm_usage_var.set(False)
@@ -1131,6 +1293,7 @@ class ScrapingApp(tk.Tk):
             "batch_size": self.batch_size_var.get(),
             "proxy_input": self.proxy_var.get(),
             "cookies_file_path": self.cookies_file_path_var.get(), # Save cookies path
+            "user_agent_type": self.user_agent_type_var.get(), # Save user agent type
             "headless_mode": self.headless_mode_var.get(),
             "disable_sandbox": self.disable_sandbox_var.get(),
             "disable_dev_shm_usage": self.disable_dev_shm_usage_var.get(),
@@ -1168,6 +1331,7 @@ class ScrapingApp(tk.Tk):
                 self.batch_size_var.set(settings.get("batch_size", 20))
                 self.proxy_var.set(settings.get("proxy_input", ""))
                 self.cookies_file_path_var.set(settings.get("cookies_file_path", "")) # Load cookies path
+                self.user_agent_type_var.set(settings.get("user_agent_type", "Random Desktop")) # Load user agent type
                 self.headless_mode_var.set(settings.get("headless_mode", True))
                 self.disable_sandbox_var.set(settings.get("disable_sandbox", True))
                 self.disable_dev_shm_usage_var.set(settings.get("disable_dev_shm_usage", False))
